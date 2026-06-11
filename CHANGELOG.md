@@ -21,7 +21,11 @@
 - Linux 桌面版/服务端取终端 cwd 改为直读 /proc（不再依赖 lsof）
 - Linux 上删除文件没有装废纸篓工具（gio/trash-put/trash）时，兜底挪到 `~/.fanbox/trash/<时间戳>/`——同样可恢复，不永久删除
 
+### Changed
+- 默认开终端（顶栏开关 / ＋号）固定在主目录：浏览目录可能正停在某个奇怪的深处（比如点过终端输出里的路径），把它当默认起点很迷惑；「在此目录打开」「一键启动 agent」「跟随浏览」等显式入口照旧跟随目录
+
 ### Fixed
+- 终端里没法复制粘贴：有选区时 Ctrl/Cmd+C 复制（无选区照旧发 SIGINT 中断），Ctrl/Cmd+V、Ctrl+Shift+V、Shift+Insert 粘贴（走 bracketed paste，多行内容不会被逐行执行）；终端区右键有选区即复制、无选区即粘贴（PuTTY 习惯）
 - 压缩包预览中文文件名乱码（#9）：不再用 `unzip -l`（它对没标 UTF-8 标志的条目按 locale 转码，GBK 名全成 ????），改为直接解析 zip central directory——文件名字节按通用标志位判 UTF-8，没标的先严格试 UTF-8、再按 GBK 解（Windows 中文环境打包的事实标准）。顺带支持 zip64，解析失败回退 unzip。zip 预览从此不依赖系统装没装 unzip
 - 以服务方式启动（systemd 等）时内嵌终端里 `claude` / `codex` 报 command not found：服务环境的 PATH 没有用户级 bin——spawn 终端时把 node 自己的 bin（npm -g 的 CLI 都在这）和 `~/.local/bin` 补进 PATH，只补缺失项不动既有顺序
 - 浏览器版终端的连接断开探测补漏：upgrade 接管的 socket 是半开模式，对端 FIN 只触发 end 不触发 close——浏览器崩溃/断网类断开此前探测不到，会留下孤儿 shell

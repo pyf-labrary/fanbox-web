@@ -2302,7 +2302,9 @@ const term = {
     return list.length;
   },
   async newTab(cwdOverride, restoreId) {
-    const startDir = cwdOverride || state.cwd;
+    // 默认（顶栏开关 / ＋号）在主目录开：浏览目录可能正停在某个奇怪的深处（点过终端里的路径等），
+    // 把它当默认起点很迷惑。「在此目录打开」「一键启动 agent」「跟随浏览」等显式传目录，不走这里
+    const startDir = cwdOverride || state.home || state.cwd;
     const id = restoreId || 't' + (++this.seq);
     const host = document.createElement('div');
     host.className = 'xterm-instance';
@@ -2351,6 +2353,35 @@ const term = {
     if (fit) try { fit.fit(); } catch { /* */ }
     const sess = { id, xterm, fit, host, dead: false, status: 'idle', unread: false, startDir, title: baseOf(startDir || '') || 'shell' };
     this.sessions.push(sess);
+    // 复制粘贴（浏览器版没有系统菜单可用；桌面版同样受益）：
+    // - 有选区时 Ctrl/Cmd+C 复制并清选区（无选区照旧发 SIGINT）；Ctrl+Shift+C 总是复制
+    // - Ctrl/Cmd+V、Ctrl+Shift+V、Shift+Insert 粘贴（经 xterm.paste 走 bracketed paste，多行不会被逐行执行）
+    // - 终端区右键：有选区=复制，无选区=粘贴（PuTTY 习惯），不弹浏览器菜单
+    const doCopy = () => {
+      const s0 = xterm.getSelection();
+      if (s0) navigator.clipboard.writeText(s0).then(() => toast('已复制')).catch(() => {});
+      return !!s0;
+    };
+    const doPaste = () => {
+      navigator.clipboard.readText()
+        .then((t) => { if (t) xterm.paste(t); })
+        .catch(() => toast('浏览器拒绝读取剪贴板——请在地址栏左侧授权后重试', true));
+    };
+    xterm.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== 'keydown') return true;
+      const mod = ev.ctrlKey || ev.metaKey;
+      if (mod && ev.shiftKey && ev.code === 'KeyC') { ev.preventDefault(); doCopy(); return false; }
+      if (mod && ev.shiftKey && ev.code === 'KeyV') { ev.preventDefault(); doPaste(); return false; }
+      if (mod && !ev.shiftKey && ev.code === 'KeyC' && xterm.hasSelection()) { ev.preventDefault(); doCopy(); xterm.clearSelection(); return false; }
+      if (mod && !ev.shiftKey && ev.code === 'KeyV') { ev.preventDefault(); doPaste(); return false; }
+      if (ev.shiftKey && ev.code === 'Insert') { ev.preventDefault(); doPaste(); return false; }
+      return true;
+    });
+    host.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation(); // 不触发空白处「新建」菜单
+      if (xterm.hasSelection()) { doCopy(); xterm.clearSelection(); } else doPaste();
+    });
     // OSC 7 目录跟随：spawn 注入的 PROMPT_COMMAND（bash）或用户已有的终端集成（zsh/VS Code 等）
     // 每次画提示符上报 $PWD；「刚画过提示符」也是空闲 shell 的可靠信号
     if (xterm.parser && xterm.parser.registerOscHandler) {
