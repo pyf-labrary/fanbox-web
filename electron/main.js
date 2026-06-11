@@ -275,6 +275,11 @@ ipcMain.handle('pty:spawn', (e, { id, cwd, cols, rows }) => {
   // GUI 启动的 app 不继承 shell 的 locale，zsh 会把中文路径按字节转义成 \M-^@ 乱码 → 兜底 UTF-8
   const env = { ...process.env, TERM: 'xterm-256color', FANBOX: '1' };
   if (process.platform !== 'win32' && !/UTF-8/i.test(env.LC_ALL || env.LC_CTYPE || env.LANG || '')) env.LANG = 'zh_CN.UTF-8';
+  // OSC 7 目录上报：bash 每次画提示符时打印 $PWD，前端据此跟随真实 cwd——Windows 没有 lsof，
+  // 这是 WSL 会话唯一的 cwd 来源（WSLENV 把变量带进发行版）；用户 .bashrc 自己设了 PROMPT_COMMAND 会覆盖，尽力而为
+  const osc7 = `printf '\\033]7;file://%s\\033\\\\' "$PWD"`;
+  if (wsl) { env.PROMPT_COMMAND = osc7; env.WSLENV = (env.WSLENV ? env.WSLENV + ':' : '') + 'PROMPT_COMMAND/u'; }
+  else if (/bash$/.test(shellPath)) env.PROMPT_COMMAND = osc7;
   let p;
   try {
     p = pty.spawn(shellPath, shellArgs, {
@@ -350,6 +355,9 @@ ipcMain.handle('pty:cwd', (e, { id }) => new Promise((resolve) => {
   if (process.platform === 'win32') return resolve({ ok: false });
   const p = terminals.get(id);
   if (!p || !p.pid) return resolve({ ok: false });
+  if (process.platform === 'linux') { // /proc 直读，比 lsof 快且不依赖安装
+    try { return resolve({ ok: true, cwd: fs.readlinkSync(`/proc/${p.pid}/cwd`) }); } catch { return resolve({ ok: false }); }
+  }
   const { exec } = require('child_process');
   exec(`lsof -a -p ${p.pid} -d cwd -Fn`, { env: { ...process.env, LC_ALL: 'en_US.UTF-8' } }, (err, stdout) => {
     if (err) return resolve({ ok: false });

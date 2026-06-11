@@ -1225,22 +1225,72 @@ const thumbInflight = new Map(); // cacheFile -> Promise，去重并发生成
 function run(cmd, args) {
   return new Promise((resolve, reject) => execFile(cmd, args, { timeout: 15000 }, (e) => (e ? reject(e) : resolve())));
 }
-// 图片走 sips 缩放（快）；视频/PDF/其它走 qlmanage QuickLook 抽帧
+// 探测系统里有没有某个命令（结果进程级缓存）
+const binCache = new Map();
+function hasBin(name) {
+  if (binCache.has(name)) return Promise.resolve(binCache.get(name));
+  return new Promise((resolve) => {
+    execFile(PLATFORM === 'win32' ? 'where.exe' : 'which', [name], { timeout: 4000 }, (err) => {
+      binCache.set(name, !err);
+      resolve(!err);
+    });
+  });
+}
+// ffmpeg 出图：图片直接缩放，视频取 1s 处一帧（图片视频都等比缩进 size 盒子）
+function ffmpegThumb(src, size, out, isVideo) {
+  const args = ['-y', '-loglevel', 'error'];
+  if (isVideo) args.push('-ss', '1');
+  args.push('-i', src, '-frames:v', '1', '-vf', `scale=w='min(${size},iw)':h='min(${size},ih)':force_original_aspect_ratio=decrease`, out);
+  return run('ffmpeg', args);
+}
+// Windows 图片缩略图：PowerShell + System.Drawing（系统自带，png/jpg/gif/bmp/tiff 都认；webp/heic 不认→415 回退图标）
+function psThumb(src, size, out) {
+  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  const fmt = out.endsWith('.png') ? 'Png' : 'Jpeg';
+  const script = `Add-Type -AssemblyName System.Drawing; `
+    + `$i=[System.Drawing.Image]::FromFile(${q(src)}); `
+    + `$r=[Math]::Min(1, ${size} / [Math]::Max($i.Width, $i.Height)); `
+    + `$w=[int][Math]::Max(1, $i.Width*$r); $h=[int][Math]::Max(1, $i.Height*$r); `
+    + `$b=New-Object System.Drawing.Bitmap($i, $w, $h); `
+    + `$b.Save(${q(out)}, [System.Drawing.Imaging.ImageFormat]::${fmt}); `
+    + `$b.Dispose(); $i.Dispose()`;
+  return new Promise((resolve, reject) => {
+    execFile('powershell', ['-NoProfile', '-Command', script], { timeout: 15000, windowsHide: true }, (e) => (e ? reject(e) : resolve()));
+  });
+}
+// mac：图片 sips、其余 qlmanage；Windows：System.Drawing + ffmpeg（视频，装了才有）；
+// linux：ImageMagick / ffmpeg 谁在用谁。生成不了就抛错 → 415 → 前端回退矢量图标
 async function generateThumb(src, e, size, cacheFile, isImg) {
   await fsp.mkdir(THUMB_DIR, { recursive: true });
-  if (isImg) {
-    const fmt = cacheFile.endsWith('.png') ? 'png' : 'jpeg';
-    await run('sips', ['-s', 'format', fmt, '-Z', String(size), src, '--out', cacheFile]);
+  if (PLATFORM === 'darwin') {
+    if (isImg) {
+      const fmt = cacheFile.endsWith('.png') ? 'png' : 'jpeg';
+      await run('sips', ['-s', 'format', fmt, '-Z', String(size), src, '--out', cacheFile]);
+      return;
+    }
+    const tmpDir = path.join(THUMB_DIR, '_ql_' + process.pid + '_' + crypto.randomBytes(4).toString('hex'));
+    await fsp.mkdir(tmpDir, { recursive: true });
+    try {
+      await run('qlmanage', ['-t', '-s', String(size), '-o', tmpDir, src]);
+      const png = (await fsp.readdir(tmpDir)).find((f) => f.endsWith('.png'));
+      if (!png) throw new Error('no thumb');
+      await fsp.rename(path.join(tmpDir, png), cacheFile);
+    } finally { fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {}); }
     return;
   }
-  const tmpDir = path.join(THUMB_DIR, '_ql_' + process.pid + '_' + crypto.randomBytes(4).toString('hex'));
-  await fsp.mkdir(tmpDir, { recursive: true });
-  try {
-    await run('qlmanage', ['-t', '-s', String(size), '-o', tmpDir, src]);
-    const png = (await fsp.readdir(tmpDir)).find((f) => f.endsWith('.png'));
-    if (!png) throw new Error('no thumb');
-    await fsp.rename(path.join(tmpDir, png), cacheFile);
-  } finally { fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {}); }
+  if (PLATFORM === 'win32') {
+    if (isImg) { await psThumb(src, size, cacheFile); return; }
+    if (VIDEO_EXT.has(e) && await hasBin('ffmpeg')) { await ffmpegThumb(src, size, cacheFile, true); return; }
+    throw new Error('no thumb tool');
+  }
+  if (isImg) {
+    // gif 取第一帧（[0]），不然 convert 会展开所有帧出一摞文件
+    if (await hasBin('convert')) { await run('convert', [src + (e === 'gif' ? '[0]' : ''), '-auto-orient', '-thumbnail', `${size}x${size}>`, cacheFile]); return; }
+    if (await hasBin('ffmpeg')) { await ffmpegThumb(src, size, cacheFile, false); return; }
+    throw new Error('no thumb tool');
+  }
+  if (VIDEO_EXT.has(e) && await hasBin('ffmpeg')) { await ffmpegThumb(src, size, cacheFile, true); return; }
+  throw new Error('no thumb tool');
 }
 // 缩略图缓存按总体积上限做 LRU 裁剪（同一文件改一次就多一个缓存键，不清会无限涨）
 async function pruneThumbs(maxBytes = 400 * 1024 * 1024) {
@@ -1343,6 +1393,25 @@ function readBody(req) {
 // Codex：~/.codex/sessions/**/rollout-*.jsonl 的 token_count 事件带 rate_limits（5h 窗口/周配额百分比，官方数）→ tail 取最新快照
 const CLAUDE_PROJ = path.join(HOME, '.claude', 'projects');
 const CODEX_SESS = path.join(HOME, '.codex', 'sessions');
+// agent 数据根：本机 home + Windows 上各 WSL 发行版的 home（用量/触发统计/凭证都按这一组找）
+let _agentDataRootsP = null;
+function agentDataRoots() {
+  if (_agentDataRootsP) return _agentDataRootsP;
+  _agentDataRootsP = (async () => {
+    const roots = [{ claudeProj: CLAUDE_PROJ, codexSess: CODEX_SESS, cred: path.join(HOME, '.claude', '.credentials.json') }];
+    if (PLATFORM === 'win32') {
+      for (const w of await wslRoots()) {
+        roots.push({
+          claudeProj: path.join(w.home, '.claude', 'projects'),
+          codexSess: path.join(w.home, '.codex', 'sessions'),
+          cred: path.join(w.home, '.claude', '.credentials.json'),
+        });
+      }
+    }
+    return roots;
+  })();
+  return _agentDataRootsP;
+}
 const claudeFileCache = new Map(); // file -> { offset, lastMsgId, events: [{t, in, out, cc, cr}] }
 let usageResultCache = { at: 0, data: null };
 
@@ -1381,16 +1450,20 @@ async function parseClaudeFile(file, stat) {
 async function claudeUsage() {
   const cutoff = Date.now() - 8 * 86400000;
   const files = [];
-  let dirs;
-  try { dirs = await fsp.readdir(CLAUDE_PROJ); } catch { return null; } // 没装/没用过 Claude Code
-  await Promise.all(dirs.map(async (d) => {
-    let names;
-    try { names = await fsp.readdir(path.join(CLAUDE_PROJ, d)); } catch { return; }
-    await Promise.all(names.filter((n) => n.endsWith('.jsonl')).map(async (n) => {
-      const fp = path.join(CLAUDE_PROJ, d, n);
-      try { const st = await fsp.stat(fp); if (st.mtimeMs >= cutoff) files.push({ fp, st }); } catch { /* */ }
+  let any = false;
+  for (const root of await agentDataRoots()) {
+    let dirs;
+    try { dirs = await fsp.readdir(root.claudeProj); any = true; } catch { continue; }
+    await Promise.all(dirs.map(async (d) => {
+      let names;
+      try { names = await fsp.readdir(path.join(root.claudeProj, d)); } catch { return; }
+      await Promise.all(names.filter((n) => n.endsWith('.jsonl')).map(async (n) => {
+        const fp = path.join(root.claudeProj, d, n);
+        try { const st = await fsp.stat(fp); if (st.mtimeMs >= cutoff) files.push({ fp, st }); } catch { /* */ }
+      }));
     }));
-  }));
+  }
+  if (!any) return null; // 哪儿都没装/没用过 Claude Code
   const live = new Set(files.map((f) => f.fp));
   for (const k of claudeFileCache.keys()) { if (!live.has(k)) claudeFileCache.delete(k); } // 过期文件出缓存
   const all = [];
@@ -1422,7 +1495,7 @@ async function codexUsage() {
       }
     }
   };
-  await walk(CODEX_SESS, 0);
+  for (const root of await agentDataRoots()) await walk(root.codexSess, 0);
   if (!files.length) return null;
   files.sort((a, b) => b.mtimeMs - a.mtimeMs);
   for (const f of files.slice(0, 10)) { // 最新几个会话里找；都没有就放弃
@@ -1481,8 +1554,14 @@ async function claudeOAuthToken() {
       if (t) return t;
     } catch { /* 落到凭证文件 */ }
   }
-  try { return pick(await fsp.readFile(path.join(HOME, '.claude', '.credentials.json'), 'utf8')); }
-  catch { return null; }
+  // 凭证文件按 agent 数据根逐个找：本机 home 没有就看 WSL 发行版里的 ~/.claude/.credentials.json
+  for (const root of await agentDataRoots()) {
+    try {
+      const t = pick(await fsp.readFile(root.cred, 'utf8'));
+      if (t) return t;
+    } catch { /* 下一处 */ }
+  }
+  return null;
 }
 
 // 终端启动时 curl 自己会认 http_proxy 等环境变量；但打包 App 从 Finder/Dock 启动没有这些变量，
@@ -1688,16 +1767,18 @@ async function scanSkillRoot(root, source, label, out, disabled = false) {
 const claudeSkillStatCache = new Map(); // file -> { offset, events: [{t, skill}] }
 async function claudeSkillEvents(cutoff) {
   const files = [];
-  let dirs;
-  try { dirs = await fsp.readdir(CLAUDE_PROJ); } catch { return []; }
-  await Promise.all(dirs.map(async (d) => {
-    let names;
-    try { names = await fsp.readdir(path.join(CLAUDE_PROJ, d)); } catch { return; }
-    await Promise.all(names.filter((n) => n.endsWith('.jsonl')).map(async (n) => {
-      const fp = path.join(CLAUDE_PROJ, d, n);
-      try { const st = await fsp.stat(fp); if (st.mtimeMs >= cutoff) files.push({ fp, st }); } catch { /* */ }
+  for (const root of await agentDataRoots()) {
+    let dirs;
+    try { dirs = await fsp.readdir(root.claudeProj); } catch { continue; }
+    await Promise.all(dirs.map(async (d) => {
+      let names;
+      try { names = await fsp.readdir(path.join(root.claudeProj, d)); } catch { return; }
+      await Promise.all(names.filter((n) => n.endsWith('.jsonl')).map(async (n) => {
+        const fp = path.join(root.claudeProj, d, n);
+        try { const st = await fsp.stat(fp); if (st.mtimeMs >= cutoff) files.push({ fp, st }); } catch { /* */ }
+      }));
     }));
-  }));
+  }
   const live = new Set(files.map((f) => f.fp));
   for (const k of claudeSkillStatCache.keys()) { if (!live.has(k)) claudeSkillStatCache.delete(k); }
   const all = [];
@@ -1758,7 +1839,7 @@ async function codexSkillEvents(cutoff) {
       }
     }
   };
-  await walk(CODEX_SESS, 0);
+  for (const root of await agentDataRoots()) await walk(root.codexSess, 0);
   const live = new Set(files.map((f) => f.fp));
   for (const k of codexSkillStatCache.keys()) { if (!live.has(k)) codexSkillStatCache.delete(k); }
   const all = [];
@@ -1791,7 +1872,7 @@ async function skillsData() {
   await scanSkillRoot(CLAUDE_SKILLS, 'claude', '~/.claude', items);
   await scanSkillRoot(CODEX_SKILLS, 'codex', '~/.codex', items);
   await scanSkillRoot(AGENTS_SKILLS, 'agents', '~/.agents', items);
-  // Windows 上把各 WSL 发行版的 skills 也扫进来（触发统计仍只读本机日志，WSL 侧的次数不计）
+  // Windows 上把各 WSL 发行版的 skills 也扫进来（触发统计同样按多根聚合，见 claudeSkillEvents）
   if (PLATFORM === 'win32') {
     for (const w of await wslRoots()) {
       await scanSkillRoot(path.join(w.home, '.claude', 'skills'), 'claude', `${w.distro} ~/.claude`, items);
@@ -1951,7 +2032,57 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (p === '/api/roots') {
-      return sendJSON(res, 200, { home: HOME, platform: PLATFORM, sep: path.sep, isWsl: IS_WSL, roots: await defaultRoots() });
+      return sendJSON(res, 200, {
+        home: HOME, platform: PLATFORM, sep: path.sep, isWsl: IS_WSL, roots: await defaultRoots(),
+        term: { available: !!nodePty, hint: nodePtyHint }, // 浏览器版终端能力（桌面版走 Electron IPC，不看这个）
+      });
+    }
+    // 浏览器版终端的 cwd / 前台进程（桌面版走 Electron IPC）
+    if (p === '/api/term/cwd') {
+      return sendJSON(res, 200, await ptyCwd(qp.get('id')));
+    }
+    if (p === '/api/term/proc') {
+      const t = ptys.get(qp.get('id'));
+      return sendJSON(res, 200, t && t.p ? { ok: true, proc: t.p.process || '' } : { ok: false });
+    }
+    // 浏览器版文件变化推送：SSE 事件流 + 监听集更新
+    if (p === '/api/fs-events') {
+      const cid = qp.get('cid') || '';
+      if (!cid) { res.writeHead(400); res.end('cid required'); return; }
+      sseDrop(cid); // 同 cid 重连（刷新页面）：旧流收掉
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.write('retry: 2000\n\n');
+      const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch { /* */ } }, 25000); // 心跳防代理掐线
+      sseClients.set(cid, { res, watchers: new Map(), hb });
+      req.on('close', () => sseDrop(cid));
+      return;
+    }
+    if (p === '/api/fs-watch' && req.method === 'POST') {
+      const b = await readBody(req);
+      return sendJSON(res, 200, sseWatchSet(String(b.cid || ''), b.dirs));
+    }
+    // 浏览器拖入文件落盘换路径（喂给终端 agent 用）；原始字节流，不走 JSON
+    if (p === '/api/drop-save' && req.method === 'POST') {
+      const safe = String(qp.get('name') || '拖入文件.bin').replace(/[/\\:\0]/g, '_').slice(-128) || '拖入文件.bin';
+      const dir = path.join(os.tmpdir(), 'fanbox-drops');
+      await fsp.mkdir(dir, { recursive: true });
+      let dest = path.join(dir, safe);
+      if (fs.existsSync(dest)) dest = path.join(dir, `${Date.now()}-${safe}`);
+      const out = fs.createWriteStream(dest);
+      let size = 0, aborted = false;
+      req.on('data', (c) => {
+        size += c.length;
+        if (size > MAX_BODY && !aborted) {
+          aborted = true;
+          out.destroy(); fsp.unlink(dest).catch(() => {});
+          try { req.destroy(); } catch { /* */ }
+          sendJSON(res, 200, { ok: false, error: '文件太大（上限 64MB）' });
+        }
+      });
+      req.pipe(out);
+      out.on('finish', () => { if (!aborted) sendJSON(res, 200, { ok: true, path: dest }); });
+      out.on('error', () => { if (!aborted) { aborted = true; sendJSON(res, 200, { ok: false, error: '写入失败' }); } });
+      return;
     }
     if (p === '/api/list') {
       return sendJSON(res, 200, await listDir(qp.get('path') || HOME));
@@ -2109,6 +2240,195 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 500, { error: err.message });
   }
 });
+
+// ---------- 内嵌终端（浏览器版）：node-pty + 零依赖 WebSocket 透传 ----------
+// 桌面版终端走 Electron IPC；浏览器版走这里——同一个 node-pty，换条本机回环的 WS 通道。
+// node-pty 是唯一的原生依赖且按「装得上就用」处理：没装/ABI 不对时终端不可用，其余功能照常。
+let nodePty = null, nodePtyHint = '';
+try { nodePty = require('node-pty'); }
+catch {
+  nodePtyHint = '内嵌终端需要 node-pty：在 fanbox 目录执行 npm install --omit=dev 后重启'
+    + '（如果之前为桌面版编译过，先执行 npm rebuild node-pty 切回 Node ABI）';
+}
+
+// 统一的 shell 进程孵化（与 Electron 主进程同逻辑）：Windows 下 WSL 目录直接 wsl.exe --cd 进发行版
+function spawnShellPty({ cwd, cols, rows }) {
+  const startCwd = cwd && fs.existsSync(cwd) ? cwd : HOME;
+  const wsl = PLATFORM === 'win32' ? wslOfPath(startCwd) : null;
+  const file = wsl ? 'wsl.exe' : (PLATFORM === 'win32' ? 'powershell.exe' : (process.env.SHELL || (PLATFORM === 'darwin' ? '/bin/zsh' : '/bin/bash')));
+  const args = wsl ? ['-d', wsl.distro, '--cd', wsl.linuxPath] : [];
+  const env = { ...process.env, TERM: 'xterm-256color', FANBOX: '1' };
+  if (PLATFORM !== 'win32' && !/UTF-8/i.test(env.LC_ALL || env.LC_CTYPE || env.LANG || '')) env.LANG = 'zh_CN.UTF-8';
+  // OSC 7 目录上报：bash 每次画提示符时打印 $PWD，前端 xterm 解析后实现「标题跟随/定位到终端目录」，
+  // 也是 Windows（没有 lsof）唯一的 cwd 来源；WSL 会话靠 WSLENV 把变量带进发行版。
+  // 用户 .bashrc 若自己设了 PROMPT_COMMAND 会覆盖掉——属于「有集成就用」的尽力而为
+  const osc7 = `printf '\\033]7;file://%s\\033\\\\' "$PWD"`;
+  if (wsl) { env.PROMPT_COMMAND = osc7; env.WSLENV = (env.WSLENV ? env.WSLENV + ':' : '') + 'PROMPT_COMMAND/u'; }
+  else if (/bash$/.test(file)) env.PROMPT_COMMAND = osc7;
+  const p = nodePty.spawn(file, args, {
+    name: 'xterm-256color', cols: cols || 80, rows: rows || 24,
+    cwd: wsl ? HOME : startCwd, // ConPTY 不接受 UNC cwd，目录交给 --cd
+    env,
+  });
+  return { p, startCwd, wsl };
+}
+
+// 极简 WebSocket 服务端（只服务本机终端通道）：握手 + 帧编解码，无压缩、支持客户端分片
+function wsAccept(key) { return crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64'); }
+function wsSend(sock, str) {
+  const payload = Buffer.from(str, 'utf8');
+  let header;
+  if (payload.length < 126) header = Buffer.from([0x81, payload.length]);
+  else if (payload.length < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(payload.length, 2); }
+  else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(payload.length), 2); }
+  try { sock.write(Buffer.concat([header, payload])); } catch { /* 断开由 close 收尾 */ }
+}
+function wsCloseSock(sock, code = 1000) {
+  try { const b = Buffer.alloc(4); b[0] = 0x88; b[1] = 2; b.writeUInt16BE(code, 2); sock.write(b); } catch { /* */ }
+  try { sock.end(); } catch { /* */ }
+}
+function wsListen(sock, onMsg, onClose) {
+  let buf = Buffer.alloc(0);
+  let frag = [];
+  let closed = false;
+  const fireClose = () => { if (!closed) { closed = true; onClose && onClose(); } };
+  sock.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const fin = (buf[0] & 0x80) !== 0;
+      const op = buf[0] & 0x0f;
+      const masked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) {
+        if (buf.length < 10) return;
+        const big = buf.readBigUInt64BE(2);
+        if (big > 16n * 1024n * 1024n) { wsCloseSock(sock, 1009); fireClose(); return; } // 16MB 上限
+        len = Number(big); off = 10;
+      }
+      const maskLen = masked ? 4 : 0;
+      if (buf.length < off + maskLen + len) return;
+      const mask = masked ? buf.subarray(off, off + 4) : null;
+      let payload = buf.subarray(off + maskLen, off + maskLen + len);
+      if (mask) { payload = Buffer.from(payload); for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3]; }
+      buf = buf.subarray(off + maskLen + len);
+      if (op === 8) { wsCloseSock(sock); fireClose(); return; }
+      if (op === 9) { const h = Buffer.from([0x8a, payload.length]); try { sock.write(Buffer.concat([h, payload])); } catch { /* */ } continue; } // ping→pong
+      if (op === 10) continue;
+      if (op === 0 || op === 1 || op === 2) {
+        frag.push(payload);
+        if (fin) { const whole = Buffer.concat(frag); frag = []; onMsg(whole.toString('utf8')); }
+      }
+    }
+  });
+  sock.on('error', fireClose);
+  sock.on('close', fireClose);
+}
+
+const ptys = new Map(); // id -> { p, wsl, sock }
+server.on('upgrade', (req, sock) => {
+  // 终端通道是本服务最敏感的面：WebSocket 不受 CORS 约束，任意网页都能发起连接——
+  // Host + Origin 双校验（浏览器发 WS 必带 Origin），不是本机回环一律掐掉，否则等于把 shell 暴露给所有网站
+  let originOk = false;
+  try { originOk = ALLOWED_HOSTS.has(new URL(req.headers.origin || '').hostname); } catch { originOk = false; }
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  if (!hostAllowed(req) || !originOk || url.pathname !== '/api/term/ws' || (req.headers.upgrade || '').toLowerCase() !== 'websocket' || !req.headers['sec-websocket-key']) {
+    sock.destroy(); return;
+  }
+  sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '
+    + wsAccept(req.headers['sec-websocket-key']) + '\r\n\r\n');
+  sock.setNoDelay(true);
+  const qp2 = url.searchParams;
+  const id = qp2.get('id') || ('t' + Date.now());
+  if (!nodePty) { wsSend(sock, JSON.stringify({ t: 'err', error: nodePtyHint })); wsCloseSock(sock); return; }
+  // 同 id 重连（前端「回车重开」）：旧进程先收掉
+  const old = ptys.get(id);
+  if (old) { ptys.delete(id); try { old.p.kill(); } catch { /* */ } try { wsCloseSock(old.sock); } catch { /* */ } }
+  let t;
+  try { t = spawnShellPty({ cwd: qp2.get('cwd'), cols: Number(qp2.get('cols')) || 80, rows: Number(qp2.get('rows')) || 24 }); }
+  catch (e) { wsSend(sock, JSON.stringify({ t: 'err', error: e.message })); wsCloseSock(sock); return; }
+  const ent = { p: t.p, wsl: t.wsl, sock };
+  ptys.set(id, ent);
+  wsSend(sock, JSON.stringify({ t: 'ready', cwd: t.startCwd, wsl: t.wsl ? { distro: t.wsl.distro } : null }));
+  t.p.onData((d) => wsSend(sock, JSON.stringify({ t: 'd', d })));
+  t.p.onExit(({ exitCode }) => {
+    if (ptys.get(id) === ent) ptys.delete(id);
+    wsSend(sock, JSON.stringify({ t: 'exit', code: exitCode }));
+    wsCloseSock(sock);
+  });
+  wsListen(sock, (msg) => {
+    let m; try { m = JSON.parse(msg); } catch { return; }
+    if (m.t === 'i') { try { ent.p.write(String(m.d || '')); } catch { /* */ } }
+    else if (m.t === 'r') { try { ent.p.resize(Math.max(2, m.cols | 0), Math.max(2, m.rows | 0)); } catch { /* */ } }
+    else if (m.t === 'k') { try { ent.p.kill(); } catch { /* */ } }
+  }, () => {
+    // 连接断开（关标签/刷新页面）：杀进程，不留孤儿 shell
+    if (ptys.get(id) === ent) { ptys.delete(id); try { ent.p.kill(); } catch { /* */ } }
+  });
+});
+
+// lsof 在非 UTF-8 locale 下会把中文路径按字节转义成 \xNN 字面量，解码兜底（与 Electron 主进程同款）
+function decodeLsofPath(s) {
+  if (!/\\x[0-9a-fA-F]{2}/.test(s)) return s;
+  const bytes = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\' && s[i + 1] === 'x' && /^[0-9a-fA-F]{2}$/.test(s.slice(i + 2, i + 4))) {
+      bytes.push(parseInt(s.slice(i + 2, i + 4), 16));
+      i += 3;
+    } else {
+      for (const b of Buffer.from(s[i], 'utf8')) bytes.push(b);
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+// 终端真实 cwd：linux 直读 /proc（比 lsof 快），mac 走 lsof，Windows 拿不到（前端靠 OSC7 兜）
+async function ptyCwd(id) {
+  const t = ptys.get(id);
+  if (!t || !t.p || !t.p.pid) return { ok: false };
+  if (PLATFORM === 'linux') {
+    try { return { ok: true, cwd: await fsp.readlink(`/proc/${t.p.pid}/cwd`) }; } catch { return { ok: false }; }
+  }
+  if (PLATFORM === 'darwin') {
+    return new Promise((resolve) => {
+      exec(`lsof -a -p ${t.p.pid} -d cwd -Fn`, { env: { ...process.env, LC_ALL: 'en_US.UTF-8' } }, (err, stdout) => {
+        if (err) return resolve({ ok: false });
+        const line = stdout.split('\n').find((l) => l.startsWith('n'));
+        resolve(line ? { ok: true, cwd: decodeLsofPath(line.slice(1)) } : { ok: false });
+      });
+    });
+  }
+  return { ok: false };
+}
+
+// ---------- 文件变化推送（浏览器版）：SSE 长连接 + 增量监听集（与 Electron fs:watch-set 同语义）----------
+const sseClients = new Map(); // cid -> { res, watchers: Map<dir, FSWatcher>, hb }
+function sseDrop(cid) {
+  const c = sseClients.get(cid);
+  if (!c) return;
+  sseClients.delete(cid);
+  clearInterval(c.hb);
+  for (const w of c.watchers.values()) { try { w.close(); } catch { /* */ } }
+  try { c.res.end(); } catch { /* */ }
+}
+function sseWatchSet(cid, dirs) {
+  const c = sseClients.get(cid);
+  if (!c) return { ok: false, error: '事件流还没建立' };
+  const want = new Set((dirs || []).filter(Boolean).slice(0, 50));
+  for (const [dir, w] of c.watchers) { if (!want.has(dir)) { try { w.close(); } catch { /* */ } c.watchers.delete(dir); } }
+  for (const dir of want) {
+    if (c.watchers.has(dir) || !fs.existsSync(dir)) continue;
+    try {
+      const recursive = PLATFORM !== 'linux'; // linux 递归不可靠，降级非递归（与桌面版一致）
+      const w = fs.watch(dir, { persistent: false, recursive }, (evt, filename) => {
+        try { c.res.write(`data: ${JSON.stringify({ dir, filename: filename ? filename.toString() : null })}\n\n`); } catch { /* */ }
+      });
+      c.watchers.set(dir, w);
+    } catch { /* 无权限等，跳过该目录 */ }
+  }
+  return { ok: true, count: c.watchers.size };
+}
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {

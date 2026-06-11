@@ -112,7 +112,7 @@ Download the latest `.dmg` from [**Releases**](https://github.com/alchaincyf/fan
 node server.js
 ```
 
-Open `http://localhost:4567`. Zero dependencies, zero build — clone and run. The web version covers browsing/search/preview (the embedded terminal and editors need Electron).
+Open `http://localhost:4567`. Zero build — clone and run. The embedded terminal works in the browser too: the server bridges node-pty over a zero-dependency WebSocket, so you can command Claude Code / Codex from the web UI just like the desktop app (`npm install --omit=dev` once for node-pty; without it everything else still works). Note: refreshing the page ends terminal sessions in the browser version.
 
 ### Windows + WSL
 
@@ -308,7 +308,7 @@ FanBox 把这条链路收进一个窗口：**左边文件 × 右边/下边终端
 node server.js
 ```
 
-浏览器打开 `http://localhost:4567`。零依赖、零 build，clone 下来就能跑。网页版只有文件浏览/搜索/预览（内嵌终端和编辑器靠 Electron 提供）。
+浏览器打开 `http://localhost:4567`。零 build，clone 下来就能跑。内嵌终端在浏览器里同样可用：服务端把 node-pty 经零依赖 WebSocket 透传给网页 xterm，跑 Claude Code / Codex、拖路径喂 agent 与桌面版一致（首次 `npm install --omit=dev` 装上 node-pty；装不上其余功能照常）。注意：网页版刷新页面会结束终端会话。
 
 ### Windows + WSL
 

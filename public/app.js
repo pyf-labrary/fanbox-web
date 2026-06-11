@@ -1582,6 +1582,7 @@ async function loadRoots() {
   const ul = $('#roots-list');
   ul.innerHTML = '';
   data.roots.forEach((r) => ul.appendChild(navDirLi(r.name, r.path)));
+  return data; // init 用 term 能力信息决定要不要装浏览器版终端 shim
 }
 function renderRootsActive() {
   $('#roots-list').querySelectorAll('li').forEach((li) => li.classList.toggle('active', li.dataset.path === state.cwd));
@@ -2067,7 +2068,12 @@ const term = {
   },
   theme() { return this.themes[state.theme] || this.themes.terminal; },
   toggle() {
-    if (!this.available()) { if (state.cwd) openWith(state.cwd, 'terminal'); return; } // 浏览器降级到系统终端
+    if (!this.available()) {
+      // 浏览器版且服务端没装 node-pty：说清怎么装，再降级到系统终端
+      if (window.__termHint) toast(window.__termHint, true);
+      if (state.cwd) openWith(state.cwd, 'terminal');
+      return;
+    }
     const hidden = $('#terminal-panel').classList.contains('hidden');
     hidden ? this.open() : this.close();
   },
@@ -2148,24 +2154,26 @@ const term = {
       if (cur && !cur.dead && await this.isPlainShell(cur)) sess = cur;
     }
     if (!sess) sess = await this.openInDir(state.cwd); // 等 spawn 完，拿确切 session 写入
-    if (sess && !sess.dead) { this.input(sess.id, cmd + '\r'); sess.xterm.focus(); toast('已在终端启动 ' + cmd); }
+    if (sess && !sess.dead) { sess.lastAgent = String(cmd).trim().split(/\s+/)[0].toLowerCase(); this.input(sess.id, cmd + '\r'); sess.xterm.focus(); toast('已在终端启动 ' + cmd); }
     else toast('终端启动失败', true);
   },
   // 在指定目录新开标签跑命令（续会话/发版等）：不复用别处的空闲 shell，目录必须对
   async runInDir(dir, cmd, msg) {
     if (!this.available()) { openWith(dir, 'terminal'); return; }
     const sess = await this.openInDir(dir);
-    if (sess && !sess.dead) { this.input(sess.id, cmd + '\r'); sess.xterm.focus(); toast(msg || '已在终端启动'); }
+    if (sess && !sess.dead) { sess.lastAgent = String(cmd).trim().split(/\s+/)[0].toLowerCase(); this.input(sess.id, cmd + '\r'); sess.xterm.focus(); toast(msg || '已在终端启动'); }
     else toast('终端启动失败', true);
   },
-  // 该会话前台是不是裸 shell？判断不了一律按「不是」处理——宁可新开标签，也不往运行中的程序里打字
+  // 该会话前台是不是裸 shell？判断不了一律按「不是」处理——宁可新开标签，也不往运行中的程序里打字。
+  // WSL 会话从 Windows 侧只能看到 wsl.exe 外壳：退而用 OSC7 的「刚画过提示符」信号判断空闲
   async isPlainShell(s) {
     try {
       const r = await window.fanboxPty.proc(s.id);
-      if (!r || !r.ok || !r.proc) return false;
-      const name = String(r.proc).split('/').pop().replace(/^-/, '').toLowerCase();
-      return ['zsh', 'bash', 'fish', 'sh', 'dash', 'tcsh', 'nu', 'pwsh', 'powershell.exe', 'cmd.exe'].includes(name);
-    } catch { return false; }
+      const name = String((r && r.proc) || '').split(/[\\/]/).pop().replace(/^-/, '').toLowerCase();
+      if (['zsh', 'bash', 'fish', 'sh', 'dash', 'tcsh', 'nu', 'pwsh', 'powershell.exe', 'cmd.exe'].includes(name)) return true;
+      if (s.wsl || !r || !r.ok || !r.proc) return !!s.atPrompt;
+      return false;
+    } catch { return !!s.atPrompt; }
   },
   // 把预览里选中的文字作为「上下文」喂给终端 agent：带文件出处 + 围栏，bracketed paste 防逐行误提交
   sendContext(text, srcPath) {
@@ -2188,8 +2196,9 @@ const term = {
     const s = this.sessions.find((x) => x.id === id);
     if (s) {
       s.lastInput = Date.now();
-      // 回车多半提交了条命令（cd 这类被回显过滤、不走 busy 周期），稍后把标题对齐真实目录
-      if (d.indexOf('\r') !== -1) { clearTimeout(s._cwdT); s._cwdT = setTimeout(() => this.refreshCwd(s, true), 800); }
+      // 回车多半提交了条命令（cd 这类被回显过滤、不走 busy 周期），稍后把标题对齐真实目录；
+      // 同时离开提示符态——下一次 OSC7 上报（命令跑完重画提示符）再回到空闲
+      if (d.indexOf('\r') !== -1) { s.atPrompt = false; clearTimeout(s._cwdT); s._cwdT = setTimeout(() => this.refreshCwd(s, true), 800); }
     }
     window.fanboxPty.input(id, d);
   },
@@ -2268,11 +2277,14 @@ const term = {
     $('#term-follow').classList.toggle('on', on);
     if (on && this.active && state.cwd) this.syncCd(state.cwd);
   },
-  // 定位文件区到活动终端的真实目录
+  // 定位文件区到活动终端的真实目录：lsof//proc 取不到（Windows）就用 OSC7 跟踪到的 cwd
   async locateCwd() {
     if (!this.active) return;
-    const r = await window.fanboxPty.cwd(this.active);
-    if (r && r.ok && r.cwd) navigate(r.cwd);
+    const s = this.sessions.find((x) => x.id === this.active);
+    let r = null;
+    try { r = await window.fanboxPty.cwd(this.active); } catch { /* */ }
+    const cwd = (r && r.ok && r.cwd) || (s && s.cwd) || '';
+    if (cwd) navigate(cwd);
     else toast('取终端目录失败', true);
   },
   // 项目身份色：路径稳定哈希到色相——同一项目的标签色点永远一个色，扫一眼即配对
@@ -2344,6 +2356,25 @@ const term = {
     if (fit) try { fit.fit(); } catch { /* */ }
     const sess = { id, xterm, fit, host, dead: false, status: 'idle', unread: false, startDir, title: baseOf(startDir || '') || 'shell' };
     this.sessions.push(sess);
+    // OSC 7 目录跟随：spawn 注入的 PROMPT_COMMAND（bash/WSL）或用户已有的终端集成（zsh/VS Code 等）
+    // 每次画提示符上报 $PWD。这是 Windows 上唯一的 cwd 来源；「刚画过提示符」也是空闲 shell 的可靠信号
+    if (xterm.parser && xterm.parser.registerOscHandler) {
+      xterm.parser.registerOscHandler(7, (data) => {
+        const m = /^file:\/\/[^/]*(\/.*)$/.exec(String(data || ''));
+        if (!m) return true;
+        let lp = m[1];
+        try { lp = decodeURIComponent(lp); } catch { /* 未编码形态直接用 */ }
+        sess.atPrompt = true;
+        const local = sess.wsl ? uncOf(sess.wsl.distro, lp) : lp; // WSL 会话上报的是 Linux 路径，导航用 UNC 形态
+        if (local !== sess.cwd) {
+          sess.cwd = local;
+          sess.title = baseOf(local) || sess.title;
+          this.renderTabs();
+          renderBreadcrumb(); // 面包屑的项目配对色点跟着换
+        }
+        return true;
+      });
+    }
     this.activate(id);
     updateWatches(); // 新终端的项目目录也纳入监听
     const r = await window.fanboxPty.spawn({ id, cwd: startDir, cols: xterm.cols, rows: xterm.rows });
@@ -2859,12 +2890,16 @@ async function invokeSkillInTerm(name) {
   let prefix = '/';
   try {
     const r = await window.fanboxPty.proc(s.id);
-    const pn = String((r && r.proc) || '').split('/').pop().replace(/^-/, '').toLowerCase();
+    const pn = String((r && r.proc) || '').split(/[\\/]/).pop().replace(/^-/, '').toLowerCase();
     if (pn.includes('codex')) prefix = '$';
     else if (['zsh', 'bash', 'fish', 'sh', 'dash', 'tcsh', 'nu'].includes(pn)) {
       toast('终端里还没启动 agent——先点 Claude / Codex 启动按钮', true);
       s.xterm.focus();
       return;
+    } else if (pn === 'wsl.exe' || !pn) {
+      // WSL 会话只能看到外壳进程：OSC7 说还在提示符 = 没启动 agent；启动过的按最近一次启动的来
+      if (s.atPrompt) { toast('终端里还没启动 agent——先点 Claude / Codex 启动按钮', true); s.xterm.focus(); return; }
+      if (String(s.lastAgent || '').includes('codex')) prefix = '$';
     }
   } catch { /* 判断不了就按 claude 的 / 语法 */ }
   term.input(s.id, prefix + name + ' ');
@@ -3159,7 +3194,12 @@ function igniteCard(top, count) {
 }
 
 // pty 数据回流（全局一次）
-if (window.fanboxPty) {
+// 终端数据/退出事件绑定：桌面版（preload 注入 fanboxPty）在脚本加载时绑；
+// 浏览器版要等 init 里装好 WebSocket shim 再绑——抽成函数 + 防重入
+let _ptyEventsBound = false;
+function bindPtyEvents() {
+  if (_ptyEventsBound || !window.fanboxPty) return;
+  _ptyEventsBound = true;
   window.fanboxPty.onData(({ id, data }) => { const s = term.sessions.find((x) => x.id === id); if (s) { s.xterm.write(data); term.markBusy(s); } });
   window.fanboxPty.onExit(({ id }) => {
     const s = term.sessions.find((x) => x.id === id);
@@ -3171,8 +3211,13 @@ if (window.fanboxPty) {
     }
   });
 }
+bindPtyEvents();
 // 文件变化 → 自动刷新列表（看着 agent 干活）；编辑中不动预览，避免吞掉未保存内容
-if (window.fanboxFs) {
+// 同样抽成函数：浏览器版的 fanboxFs（SSE shim）在 init 里装好后再绑
+let _fsEventsBound = false;
+function bindFsEvents() {
+  if (_fsEventsBound || !window.fanboxFs) return;
+  _fsEventsBound = true;
   let rt = null;
   state.changed = new Map(); // 顶层名 → { count, files:Set, ts }
   let sweep = null;
@@ -3213,6 +3258,96 @@ if (window.fanboxFs) {
     }, 250);
   });
 }
+bindFsEvents();
+
+// ---------- 浏览器版能力 shim：与桌面版 preload 注入的 API 同形，终端/监听/拖入/剪贴板都不再缺席 ----------
+function installBrowserShims(termInfo) {
+  // 内嵌终端：WebSocket 透传服务端 node-pty（/api/term/ws）
+  if (!window.fanboxPty && termInfo && termInfo.available && window.Terminal && !window.__noXterm) {
+    const handlers = { data: [], exit: [] };
+    const socks = new Map(); // id -> WebSocket
+    window.fanboxPty = {
+      __shim: true,
+      spawn: ({ id, cwd, cols, rows }) => new Promise((resolve) => {
+        // 同 id 重开（回车 respawn）：旧连接标记弃用再关，免得它的 close 事件把新会话误标成已退出
+        const prev = socks.get(id);
+        if (prev) { prev.__superseded = true; try { prev.close(); } catch { /* */ } }
+        const q = encodeURIComponent;
+        const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/term/ws?id=${q(id)}&cwd=${q(cwd || '')}&cols=${cols || 80}&rows=${rows || 24}`);
+        socks.set(id, ws);
+        let settled = false;
+        ws.onmessage = (ev) => {
+          let m; try { m = JSON.parse(ev.data); } catch { return; }
+          if (m.t === 'd') handlers.data.forEach((cb) => cb({ id, data: m.d }));
+          else if (m.t === 'ready') { settled = true; resolve({ ok: true, cwd: m.cwd, wsl: m.wsl || null }); }
+          else if (m.t === 'exit') { ws.__exited = true; handlers.exit.forEach((cb) => cb({ id, exitCode: m.code })); }
+          else if (m.t === 'err') { settled = true; ws.__exited = true; resolve({ ok: false, error: m.error }); }
+        };
+        ws.onerror = () => { if (!settled) { settled = true; resolve({ ok: false, error: '终端通道连接失败' }); } };
+        ws.onclose = () => {
+          if (socks.get(id) === ws) socks.delete(id);
+          if (!settled) { settled = true; resolve({ ok: false, error: '终端通道已断开' }); }
+          // 服务端重启等导致的断连：补一个退出事件，UI 进入「回车重开」态
+          else if (!ws.__exited && !ws.__superseded) handlers.exit.forEach((cb) => cb({ id, exitCode: -1 }));
+        };
+      }),
+      input: (id, data) => { const ws = socks.get(id); if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'i', d: data })); },
+      resize: (id, cols, rows) => { const ws = socks.get(id); if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'r', cols, rows })); },
+      kill: (id) => { const ws = socks.get(id); if (ws) { ws.__superseded = true; try { ws.send(JSON.stringify({ t: 'k' })); } catch { /* */ } try { ws.close(); } catch { /* */ } } },
+      cwd: (id) => api('/api/term/cwd?id=' + encodeURIComponent(id)),
+      proc: (id) => api('/api/term/proc?id=' + encodeURIComponent(id)),
+      onData: (cb) => { handlers.data.push(cb); return () => {}; },
+      onExit: (cb) => { handlers.exit.push(cb); return () => {}; },
+    };
+  } else if (!window.fanboxPty && termInfo && termInfo.hint) {
+    window.__termHint = termInfo.hint; // 终端不可用的原因，点终端按钮时给人话提示
+  }
+  // 文件变化推送：SSE 长连接 + POST 更新监听集
+  if (!window.fanboxFs) {
+    const cid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const cbs = [];
+    let es = null;
+    const ensure = () => {
+      if (es) return;
+      es = new EventSource('/api/fs-events?cid=' + cid);
+      es.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; } cbs.forEach((cb) => cb(m)); };
+    };
+    window.fanboxFs = {
+      __shim: true,
+      // SSE 连接建立有时差：稍等再发监听集，避免「事件流还没建立」空转
+      watchSet: (dirs) => { ensure(); return new Promise((ok) => setTimeout(() => ok(apiPost('/api/fs-watch', { cid, dirs })), es && es.readyState === 1 ? 0 : 300)); },
+      watch: (dir) => window.fanboxFs.watchSet([dir]),
+      onChanged: (cb) => { ensure(); cbs.push(cb); return () => {}; },
+    };
+  }
+  // 系统文件拖入：浏览器拿不到真实路径，把字节交给服务端落盘换路径（拖截图喂终端 agent 等场景）
+  if (!window.fanboxDrop) {
+    window.fanboxDrop = {
+      __shim: true,
+      pathForFile: () => '',
+      saveTemp: (name, buf) => fetch('/api/drop-save?name=' + encodeURIComponent(name || ''), { method: 'POST', body: buf }).then((r) => r.json()),
+    };
+  }
+  // 剪贴板：图片走浏览器 Clipboard API（只收 png，canvas 转一遍）；文件本体浏览器给不了
+  if (!window.fanboxClipboard) {
+    window.fanboxClipboard = {
+      __shim: true,
+      copyImage: async (p) => {
+        try {
+          const img = new Image();
+          await new Promise((ok, bad) => { img.onload = ok; img.onerror = bad; img.src = fsUrl(p, Date.now()); });
+          const cv = document.createElement('canvas');
+          cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+          cv.getContext('2d').drawImage(img, 0, 0);
+          const blob = await new Promise((ok) => cv.toBlob(ok, 'image/png'));
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+          return { ok: true };
+        } catch (e) { return { ok: false, error: e.message || '浏览器拒绝了剪贴板写入' }; }
+      },
+      copyFile: async () => ({ ok: false, error: '浏览器版不支持复制文件本体（可拖拽或「在文件管理器中显示」）' }),
+    };
+  }
+}
 
 // ---------- 启动 ----------
 async function init() {
@@ -3250,7 +3385,13 @@ async function init() {
     img.src = '/fs' + encodeURI(abs);
   }, true);
   document.querySelectorAll('#theme-switch .theme-seg button').forEach((b) => { b.onclick = () => applyTheme(b.dataset.skin); });
-  await loadRoots();
+  const rootsData = await loadRoots();
+  // 浏览器版：按服务端能力装 shim（终端 WS 透传 / SSE 文件监听 / 拖入落盘 / 剪贴板），装好再绑事件
+  if (!window.fanboxEnv || !window.fanboxEnv.isDesktopApp) {
+    installBrowserShims(rootsData && rootsData.term);
+    bindPtyEvents();
+    bindFsEvents();
+  }
   await loadFavorites();
   loadAgentProjects();
   setInterval(loadAgentProjects, 120000); // agent 项目入口保持新鲜（服务端有 60s 缓存，开销很小）
