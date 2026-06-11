@@ -23,6 +23,7 @@
 
 ### Fixed
 - 压缩包预览中文文件名乱码（#9）：不再用 `unzip -l`（它对没标 UTF-8 标志的条目按 locale 转码，GBK 名全成 ????），改为直接解析 zip central directory——文件名字节按通用标志位判 UTF-8，没标的先严格试 UTF-8、再按 GBK 解（Windows 中文环境打包的事实标准）。顺带支持 zip64，解析失败回退 unzip。zip 预览从此不依赖系统装没装 unzip
+- 以服务方式启动（systemd 等）时内嵌终端里 `claude` / `codex` 报 command not found：服务环境的 PATH 没有用户级 bin——spawn 终端时把 node 自己的 bin（npm -g 的 CLI 都在这）和 `~/.local/bin` 补进 PATH，只补缺失项不动既有顺序
 - 浏览器版终端的连接断开探测补漏：upgrade 接管的 socket 是半开模式，对端 FIN 只触发 end 不触发 close——浏览器崩溃/断网类断开此前探测不到，会留下孤儿 shell
 - 透明图缩略图升级后仍显示白底（#1 回访）：v1.6.0 修复改了生成行为但缩略图 URL 没变（v=mtime 不变），浏览器按 7 天强缓存继续用修复前的白底 JPEG。给缩略图 URL 加管线版本号（THUMB_REV），版本一升旧缓存全部击穿
 

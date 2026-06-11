@@ -2159,6 +2159,13 @@ function spawnShellPty({ cwd, cols, rows }) {
   const file = process.env.SHELL || (PLATFORM === 'darwin' ? '/bin/zsh' : '/bin/bash');
   const env = { ...process.env, TERM: 'xterm-256color', FANBOX: '1' };
   if (!/UTF-8/i.test(env.LC_ALL || env.LC_CTYPE || env.LANG || '')) env.LANG = 'zh_CN.UTF-8';
+  // 以服务方式跑（systemd 等）时 PATH 很瘦，claude / codex 这类用户级 CLI 在终端里直接 command not found：
+  // 把 node 自己的 bin（npm -g 装的 CLI 都在这）和 ~/.local/bin 补进 PATH。
+  // 交互 shell 读 .bashrc 还会再加自己的，重复无害；只补缺失项，不动用户已有顺序
+  const extraBins = [path.dirname(process.execPath), path.join(HOME, '.local', 'bin')];
+  const parts = (env.PATH || '').split(path.delimiter);
+  for (const b of extraBins) if (b && !parts.includes(b)) parts.unshift(b);
+  env.PATH = parts.join(path.delimiter);
   // OSC 7 目录上报：bash 每次画提示符时打印 $PWD，前端 xterm 解析后实现「标题跟随/定位到终端目录」。
   // 用户 .bashrc 若自己设了 PROMPT_COMMAND 会覆盖掉——属于「有集成就用」的尽力而为
   const osc7 = `printf '\\033]7;file://%s\\033\\\\' "$PWD"`;
