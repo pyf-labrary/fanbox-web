@@ -1,5 +1,23 @@
 <div align="center">
 
+# 📦 翻箱 Web 版
+
+**Fork 自花叔的 [FanBox](https://github.com/alchaincyf/fanbox)** —— 本 fork 专注浏览器形态：服务端跑在 WSL / Linux / mac，浏览器里完成文件浏览 + agent 终端的全部工作流，不打包桌面 app。终端会话刷新不丢（脱管保活 + 缓冲回放），zip 中文名、透明图缩略图、终端复制粘贴等问题也已修复。
+
+<img src="docs/screenshots/terminal.png" alt="翻箱 Web 版实际界面：文件区 + 内嵌终端（刷新后输出原样回放）" width="860">
+
+<sub>实际使用截图：浏览器里跑 shell / Claude Code，刷新页面后会话自动接回、输出原样回放</sub>
+
+<img src="docs/screenshots/files.png" alt="翻箱 Web 版实际界面：zip 压缩包预览，中文文件名正常显示" width="860">
+
+<sub>zip 压缩包预览：GBK 中文文件名正常显示（自解析 central directory）</sub>
+
+</div>
+
+---
+
+<div align="center">
+
 # 📦 FanBox
 
 > *"AI spins up ten projects in an afternoon. FanBox helps you find them again."*
