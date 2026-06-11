@@ -1944,6 +1944,15 @@ const server = http.createServer(async (req, res) => {
       const t = ptys.get(qp.get('id'));
       return sendJSON(res, 200, t && t.p ? { ok: true, proc: t.p.process || '' } : { ok: false });
     }
+    // 存活的终端会话清单：刷新页面后前端据此重建标签、接回会话（含还挂着连接的，便于多标签覆盖判断）
+    if (p === '/api/term/sessions') {
+      const sessions = [];
+      for (const [id, ent] of ptys) {
+        const c = await ptyCwd(id);
+        sessions.push({ id, startCwd: ent.startCwd, cwd: (c.ok && c.cwd) || ent.startCwd, attached: !!ent.sock });
+      }
+      return sendJSON(res, 200, { ok: true, sessions });
+    }
     // 浏览器版文件变化推送：SSE 事件流 + 监听集更新
     if (p === '/api/fs-events') {
       const cid = qp.get('cid') || '';
@@ -2214,9 +2223,28 @@ function wsListen(sock, onMsg, onClose) {
   });
   sock.on('error', fireClose);
   sock.on('close', fireClose);
+  // upgrade 接管的 socket 是半开模式（http 模块不替我们收尾）：对端 FIN 只来 'end' 不来 'close'，
+  // 不补这条，浏览器崩溃/断网类断开永远探测不到
+  sock.on('end', () => { try { sock.destroy(); } catch { /* */ } fireClose(); });
 }
 
-const ptys = new Map(); // id -> { p, wsl, sock }
+// 浏览器版终端会话注册表。刷新页面 WS 必断，但 pty 不能跟着死（跑一半的 agent 会被腰斩）：
+// 断开后进「脱管」态保活 PTY_DETACH_TTL，期间输出进环形缓冲；页面回来按 id 重新附着并回放缓冲。
+// 显式关标签（k 消息）或 TTL 到点没人接回才真正杀进程——依旧不留孤儿 shell。
+const ptys = new Map(); // id -> { p, sock|null, startCwd, buf: [string], bufLen, detachT }
+const PTY_DETACH_TTL = 30 * 60 * 1000;
+const PTY_BUF_MAX = 256 * 1024; // 回放缓冲上限（字符数）：够回放好几屏，掐头不掐尾
+function ptyPushBuf(ent, d) {
+  ent.buf.push(d);
+  ent.bufLen += d.length;
+  while (ent.bufLen > PTY_BUF_MAX && ent.buf.length > 1) ent.bufLen -= ent.buf.shift().length;
+}
+function ptyDestroy(id, ent) {
+  ptys.delete(id);
+  clearTimeout(ent.detachT);
+  try { ent.p.kill(); } catch { /* */ }
+  if (ent.sock) { try { wsCloseSock(ent.sock); } catch { /* */ } }
+}
 server.on('upgrade', (req, sock) => {
   // 终端通道是本服务最敏感的面：WebSocket 不受 CORS 约束，任意网页都能发起连接——
   // Host + Origin 双校验（浏览器发 WS 必带 Origin），不是本机回环一律掐掉，否则等于把 shell 暴露给所有网站
@@ -2231,30 +2259,45 @@ server.on('upgrade', (req, sock) => {
   sock.setNoDelay(true);
   const qp2 = url.searchParams;
   const id = qp2.get('id') || ('t' + Date.now());
+  const cols = Number(qp2.get('cols')) || 80, rows = Number(qp2.get('rows')) || 24;
   if (!nodePty) { wsSend(sock, JSON.stringify({ t: 'err', error: nodePtyHint })); wsCloseSock(sock); return; }
-  // 同 id 重连（前端「回车重开」）：旧进程先收掉
-  const old = ptys.get(id);
-  if (old) { ptys.delete(id); try { old.p.kill(); } catch { /* */ } try { wsCloseSock(old.sock); } catch { /* */ } }
-  let t;
-  try { t = spawnShellPty({ cwd: qp2.get('cwd'), cols: Number(qp2.get('cols')) || 80, rows: Number(qp2.get('rows')) || 24 }); }
-  catch (e) { wsSend(sock, JSON.stringify({ t: 'err', error: e.message })); wsCloseSock(sock); return; }
-  const ent = { p: t.p, sock };
-  ptys.set(id, ent);
-  wsSend(sock, JSON.stringify({ t: 'ready', cwd: t.startCwd }));
-  t.p.onData((d) => wsSend(sock, JSON.stringify({ t: 'd', d })));
-  t.p.onExit(({ exitCode }) => {
-    if (ptys.get(id) === ent) ptys.delete(id);
-    wsSend(sock, JSON.stringify({ t: 'exit', code: exitCode }));
-    wsCloseSock(sock);
-  });
+  let ent = ptys.get(id);
+  // fresh=1（新开标签/回车重开）：同 id 的旧会话收掉重来；不带 fresh 且会话还活着 → 重新附着
+  if (ent && qp2.get('fresh') === '1') { ptyDestroy(id, ent); ent = null; }
+  if (ent) {
+    // 重新附着：旧连接（若还挂着，如另一个浏览器标签）让位给新连接
+    if (ent.sock) { const s0 = ent.sock; ent.sock = null; try { wsCloseSock(s0); } catch { /* */ } }
+    clearTimeout(ent.detachT); ent.detachT = null;
+    ent.sock = sock;
+    try { ent.p.resize(Math.max(2, cols), Math.max(2, rows)); } catch { /* */ }
+    wsSend(sock, JSON.stringify({ t: 'ready', cwd: ent.startCwd, attached: true }));
+    if (ent.bufLen) wsSend(sock, JSON.stringify({ t: 'd', d: ent.buf.join('') })); // 回放最近输出
+  } else {
+    let t;
+    try { t = spawnShellPty({ cwd: qp2.get('cwd'), cols, rows }); }
+    catch (e) { wsSend(sock, JSON.stringify({ t: 'err', error: e.message })); wsCloseSock(sock); return; }
+    ent = { p: t.p, sock, startCwd: t.startCwd, buf: [], bufLen: 0, detachT: null };
+    ptys.set(id, ent);
+    wsSend(sock, JSON.stringify({ t: 'ready', cwd: t.startCwd }));
+    t.p.onData((d) => { ptyPushBuf(ent, d); if (ent.sock) wsSend(ent.sock, JSON.stringify({ t: 'd', d })); });
+    t.p.onExit(({ exitCode }) => {
+      if (ptys.get(id) === ent) ptys.delete(id);
+      clearTimeout(ent.detachT);
+      if (ent.sock) { wsSend(ent.sock, JSON.stringify({ t: 'exit', code: exitCode })); wsCloseSock(ent.sock); }
+    });
+  }
   wsListen(sock, (msg) => {
     let m; try { m = JSON.parse(msg); } catch { return; }
     if (m.t === 'i') { try { ent.p.write(String(m.d || '')); } catch { /* */ } }
     else if (m.t === 'r') { try { ent.p.resize(Math.max(2, m.cols | 0), Math.max(2, m.rows | 0)); } catch { /* */ } }
-    else if (m.t === 'k') { try { ent.p.kill(); } catch { /* */ } }
+    else if (m.t === 'k') { ptyDestroy(id, ent); } // 显式关标签：立刻收掉，不进脱管态
   }, () => {
-    // 连接断开（关标签/刷新页面）：杀进程，不留孤儿 shell
-    if (ptys.get(id) === ent) { ptys.delete(id); try { ent.p.kill(); } catch { /* */ } }
+    // 连接断开（刷新页面/网络抖动）：pty 转脱管态保活，TTL 内没人接回才杀——不留孤儿 shell
+    if (ptys.get(id) !== ent || ent.sock !== sock) return; // 已被新连接接管或已显式关闭
+    ent.sock = null;
+    ent.detachT = setTimeout(() => {
+      if (ptys.get(id) === ent && !ent.sock) ptyDestroy(id, ent);
+    }, PTY_DETACH_TTL);
   });
 });
 

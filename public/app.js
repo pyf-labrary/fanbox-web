@@ -2283,9 +2283,27 @@ const term = {
       }
     } catch { /* 取不到就保持原标题 */ }
   },
-  async newTab(cwdOverride) {
+  // 浏览器版：把服务端还活着的会话接回来（刷新页面不丢终端）。返回接回的数量
+  async restore() {
+    if (!window.fanboxPty || !window.fanboxPty.__shim) return 0; // 桌面版页面常驻，无此需求
+    let r = null;
+    try { r = await api('/api/term/sessions'); } catch { /* 端点不可用就当没有 */ }
+    const list = (r && r.ok && r.sessions) || [];
+    if (!list.length) return 0;
+    // seq 顶到已有 id 之上：刷新后 seq 归零，新标签不能撞上接回会话的旧 id
+    for (const s of list) { const m = /^t(\d+)$/.exec(s.id); if (m) this.seq = Math.max(this.seq, Number(m[1])); }
+    // 先把面板亮出来再建 xterm：display:none 下 fit 量不出尺寸，PTY 会以 80 列出生
+    $('#terminal-panel').classList.remove('hidden');
+    $('#terminal-resizer').classList.remove('hidden');
+    this.applyDock();
+    for (const s of list) await this.newTab(s.cwd || s.startCwd, s.id);
+    this.open();
+    toast(list.length > 1 ? `已接回 ${list.length} 个终端会话` : '已接回终端会话');
+    return list.length;
+  },
+  async newTab(cwdOverride, restoreId) {
     const startDir = cwdOverride || state.cwd;
-    const id = 't' + (++this.seq);
+    const id = restoreId || 't' + (++this.seq);
     const host = document.createElement('div');
     host.className = 'xterm-instance';
     $('#xterm-host').appendChild(host);
@@ -2354,7 +2372,8 @@ const term = {
     }
     this.activate(id);
     updateWatches(); // 新终端的项目目录也纳入监听
-    const r = await window.fanboxPty.spawn({ id, cwd: startDir, cols: xterm.cols, rows: xterm.rows });
+    // 新开标签必须 fresh（撞上服务端脱管的旧会话也不误接）；接回会话则按原 id 附着、回放缓冲
+    const r = await window.fanboxPty.spawn({ id, cwd: startDir, cols: xterm.cols, rows: xterm.rows, fresh: !restoreId });
     if (!r.ok) { sess.dead = true; xterm.write('\r\n  \x1b[31m终端启动失败：' + (r.error || '') + '\x1b[0m\r\n'); }
     else sess.cwd = r.cwd || startDir; // 末尾 renderTabs 统一带上 cwd 重画
     xterm.onData((d) => {
@@ -2467,7 +2486,7 @@ const term = {
   async respawn(sess) {
     sess.dead = false;
     sess.xterm.reset(); // 清掉死亡残留，新 shell 提示符不和旧画面叠在一起
-    const r = await window.fanboxPty.spawn({ id: sess.id, cwd: sess.startDir || state.cwd, cols: sess.xterm.cols, rows: sess.xterm.rows });
+    const r = await window.fanboxPty.spawn({ id: sess.id, cwd: sess.startDir || state.cwd, cols: sess.xterm.cols, rows: sess.xterm.rows, fresh: true });
     if (!r.ok) { sess.dead = true; sess.xterm.write('\x1b[31m重开失败：' + (r.error || '') + '\x1b[0m\r\n'); }
     else sess.cwd = r.cwd || sess.startDir;
   },
@@ -3245,12 +3264,12 @@ function installBrowserShims(termInfo) {
     const socks = new Map(); // id -> WebSocket
     window.fanboxPty = {
       __shim: true,
-      spawn: ({ id, cwd, cols, rows }) => new Promise((resolve) => {
+      spawn: ({ id, cwd, cols, rows, fresh }) => new Promise((resolve) => {
         // 同 id 重开（回车 respawn）：旧连接标记弃用再关，免得它的 close 事件把新会话误标成已退出
         const prev = socks.get(id);
         if (prev) { prev.__superseded = true; try { prev.close(); } catch { /* */ } }
         const q = encodeURIComponent;
-        const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/term/ws?id=${q(id)}&cwd=${q(cwd || '')}&cols=${cols || 80}&rows=${rows || 24}`);
+        const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/term/ws?id=${q(id)}&cwd=${q(cwd || '')}&cols=${cols || 80}&rows=${rows || 24}${fresh ? '&fresh=1' : ''}`);
         socks.set(id, ws);
         let settled = false;
         ws.onmessage = (ev) => {
@@ -3373,8 +3392,11 @@ async function init() {
   loadAgentProjects();
   setInterval(loadAgentProjects, 120000); // agent 项目入口保持新鲜（服务端有 60s 缓存，开销很小）
   await navigate(state.home, false);
-  // 恢复上次终端开合状态（dock 方位已由 applyDock 自带记忆）
-  if (localStorage.getItem('fb_term_open') === '1' && term.available()) term.open();
+  // 浏览器版先接回服务端还活着的终端会话（刷新不丢）；没有可接的再按上次开合状态恢复面板
+  if (term.available()) {
+    const restored = await term.restore();
+    if (!restored && localStorage.getItem('fb_term_open') === '1') term.open();
+  }
   maybeShowGuide();
   bindUpdateNotice();
 }

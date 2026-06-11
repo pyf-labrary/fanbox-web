@@ -14,6 +14,7 @@
 ### Added
 - **浏览器版内嵌终端（TTY 透传）**：不打包也有完整终端——服务端 node-pty 经零依赖 WebSocket 透传到网页 xterm，跑 Claude Code / Codex、拖路径、点击文件路径定位与桌面版一致。安全面：WS 升级做 Host + Origin 双校验（WebSocket 不受 CORS 约束，不校验等于把 shell 暴露给任意网页）。node-pty 装不上时终端按钮给出安装提示并降级到系统终端，其余功能不受影响（首次 `npm install --omit=dev` 即可装上）
 - **浏览器版能力补齐**：文件变化自动刷新（SSE 推送，agent 改文件实时点亮）、系统文件拖入终端（字节落盘换路径）、复制图片到剪贴板（Clipboard API）
+- **浏览器版终端会话刷新不丢**：WS 断开（刷新/崩溃/断网）后 pty 转「脱管」态保活 30 分钟，输出进 256KB 环形缓冲；页面回来自动按原 id 接回所有标签并回放最近输出，跑一半的 agent 不再被刷新腰斩。显式关标签立即收掉进程；TTL 到点没人接回也会收掉——依旧不留孤儿 shell。多个浏览器标签打开同一会话时，后来者接管、先前的标签进「回车重开」态
 - **WSL 浏览器模式**：服务端直接跑在 WSL 里（`node server.js`），Windows 浏览器访问——agent 原生跑在 Linux。需要 GUI 的动作转发给 Windows 侧：打开/定位文件走 wslview / explorer.exe，「在系统终端打开」起 Windows Terminal 进同目录，启动时自动用 Windows 默认浏览器打开页面
 - **终端目录跟随不再依赖 lsof（OSC 7 shell 集成）**：spawn 时给 bash 会话注入 PROMPT_COMMAND，每次提示符上报 $PWD——「定位到终端目录」「标签标题跟随」更可靠；zsh/VS Code 等已有 OSC 7 集成的直接受益。「刚画过提示符」同时作为空闲信号：一键启动 agent 能正确复用空闲 shell、skill 注入能识别「还没启动 agent」
 - 缩略图 Linux 支持：ImageMagick 缩图、视频帧走 ffmpeg（装了就用）；mac 维持 sips/qlmanage。生成不了照旧回退矢量图标
@@ -22,6 +23,7 @@
 
 ### Fixed
 - 压缩包预览中文文件名乱码（#9）：不再用 `unzip -l`（它对没标 UTF-8 标志的条目按 locale 转码，GBK 名全成 ????），改为直接解析 zip central directory——文件名字节按通用标志位判 UTF-8，没标的先严格试 UTF-8、再按 GBK 解（Windows 中文环境打包的事实标准）。顺带支持 zip64，解析失败回退 unzip。zip 预览从此不依赖系统装没装 unzip
+- 浏览器版终端的连接断开探测补漏：upgrade 接管的 socket 是半开模式，对端 FIN 只触发 end 不触发 close——浏览器崩溃/断网类断开此前探测不到，会留下孤儿 shell
 - 透明图缩略图升级后仍显示白底（#1 回访）：v1.6.0 修复改了生成行为但缩略图 URL 没变（v=mtime 不变），浏览器按 7 天强缓存继续用修复前的白底 JPEG。给缩略图 URL 加管线版本号（THUMB_REV），版本一升旧缓存全部击穿
 
 ## [1.7.2] - 2026-06-11
