@@ -283,6 +283,10 @@ function updateWatches() {
 }
 // shell 单引号转义（用于把路径塞进终端 cd 命令）
 function shQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+// 缩略图 URL 统一出口。THUMB_REV 是缩略图管线版本：生成行为变了就 +1（如 v1.6.0 透明图从 jpeg 改 png），
+// 否则 URL 不变（mtime 没动）+ 服务端 7 天强缓存，浏览器会一直用修复前的旧图（#1 升级后还看到白底就是这么来的）
+const THUMB_REV = 2;
+function thumbUrl(p, w, ver) { return `/api/thumb?path=${encodeURIComponent(p)}&w=${w}&v=${THUMB_REV}-${ver || 0}`; }
 function goBack() { if (state.history.length) navigate(state.history.pop(), false); }
 function goUp() { if (state.parent && state.parent !== state.cwd) navigate(state.parent); }
 
@@ -409,7 +413,7 @@ function thumbHtml(e) {
     const w = state.gridSize === 'lg' ? 320 : (state.gridSize === 'sm' ? 160 : 240);
     const fb = e.kind === 'video' ? 'window.__svgVideo' : 'window.__svgImg';
     // 照片按原比例呈现（object-fit:contain）+ 柔和投影，像散落的照片；缩略图失败回退强色字形
-    const img = `<img class="thumb" loading="lazy" decoding="async" src="/api/thumb?path=${encodeURIComponent(e.path)}&w=${w}&v=${e.mtime || 0}" alt="" onerror="this.closest('.thumb-wrap').replaceWith(Object.assign(document.createElement('span'),{className:'svg-icon',innerHTML:${fb}}))">`;
+    const img = `<img class="thumb" loading="lazy" decoding="async" src="${thumbUrl(e.path, w, e.mtime)}" alt="" onerror="this.closest('.thumb-wrap').replaceWith(Object.assign(document.createElement('span'),{className:'svg-icon',innerHTML:${fb}}))">`;
     const play = e.kind === 'video' ? '<span class="play-badge"><svg viewBox="0 0 24 24" width="40%" height="40%"><path d="M8 5.5l11 6.5-11 6.5z" fill="#fff"/></svg></span>' : '';
     return `<span class="thumb-wrap${e.kind === 'video' ? ' is-video' : ''}">${img}${play}</span>`;
   }
@@ -446,7 +450,7 @@ function listRow(e, i) {
   if (chgR) { el.dataset.changed = chgR.count > 1 ? '改·' + chgR.count : '改'; el.style.setProperty('--heat', Math.min(1, 0.4 + chgR.count * 0.12).toFixed(2)); if (chgR.files.size) el.title = '刚变更：\n' + [...chgR.files].join('\n'); }
   // 最近修改是跨目录列表，名称后缀显示来源目录，方便区分同名文件
   const dirHint = state.recentMode ? ` <span class="row-dir">· ${escapeHtml(tilde(e.dir || dirOf(e.path)))}</span>` : '';
-  el.innerHTML = `<div class="icon">${(e.kind === 'image' || e.kind === 'video') ? `<img class="thumb-sm" loading="lazy" decoding="async" src="/api/thumb?path=${encodeURIComponent(e.path)}&w=96&v=${e.mtime || 0}" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'svg-icon',innerHTML:this.dataset.fb||''}))" data-fb='${escapeHtml(iconSvg(e, 18))}'>` : `<span class="svg-icon">${iconSvg(e, 18)}</span>`}</div>
+  el.innerHTML = `<div class="icon">${(e.kind === 'image' || e.kind === 'video') ? `<img class="thumb-sm" loading="lazy" decoding="async" src="${thumbUrl(e.path, 96, e.mtime)}" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'svg-icon',innerHTML:this.dataset.fb||''}))" data-fb='${escapeHtml(iconSvg(e, 18))}'>` : `<span class="svg-icon">${iconSvg(e, 18)}</span>`}</div>
     <div class="fname">${escapeHtml(e.name)}${projBadge(e)}${dirHint}</div>
     <div class="meta">${fmtTime(e.mtime)}</div>
     <div class="meta">${e.isDir ? '' : fmtSize(e.size)}</div>
@@ -535,8 +539,8 @@ async function openPreview(e) {
     // 预览用中等缩略图（秒开）。heic/heif/tiff 浏览器无法直接渲染原图，统一走 sips 缩略图端点
     const exi = (e.name.split('.').pop() || '').toLowerCase();
     const nativeImg = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'].includes(exi);
-    const fallback = nativeImg ? `/api/raw?path=${encodeURIComponent(e.path)}&v=${e.mtime || 0}` : `/api/thumb?path=${encodeURIComponent(e.path)}&w=1600&v=${e.mtime || 0}`;
-    body.innerHTML = `<img class="pv-img" src="/api/thumb?path=${encodeURIComponent(e.path)}&w=1000&v=${e.mtime || 0}" title="点击放大" onerror="this.onerror=null;this.src='${fallback}'">`;
+    const fallback = nativeImg ? `/api/raw?path=${encodeURIComponent(e.path)}&v=${e.mtime || 0}` : thumbUrl(e.path, 1600, e.mtime);
+    body.innerHTML = `<img class="pv-img" src="${thumbUrl(e.path, 1000, e.mtime)}" title="点击放大" onerror="this.onerror=null;this.src='${fallback}'">`;
     body.querySelector('.pv-img').onclick = () => lightbox(e.path, nativeImg, e.mtime);
   } else if (k === 'video') {
     body.innerHTML = `<video controls src="/api/raw?path=${encodeURIComponent(e.path)}"></video>`;
@@ -696,7 +700,7 @@ async function closePreview() {
 function lightbox(path, nativeImg, mtime) {
   // heic/heif/tiff 无法渲染原图，放大也用大尺寸缩略图
   if (nativeImg === undefined) { const ex = (path.split('.').pop() || '').toLowerCase(); nativeImg = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'].includes(ex); }
-  const src = nativeImg ? `/api/raw?path=${encodeURIComponent(path)}&v=${mtime || 0}` : `/api/thumb?path=${encodeURIComponent(path)}&w=1600&v=${mtime || 0}`;
+  const src = nativeImg ? `/api/raw?path=${encodeURIComponent(path)}&v=${mtime || 0}` : thumbUrl(path, 1600, mtime);
   const ov = document.createElement('div');
   ov.className = 'lightbox';
   ov.innerHTML = `<img src="${src}"><div class="lb-hint">点击空白处关闭 · 滚轮缩放</div>`;
@@ -1304,7 +1308,7 @@ const shotTray = {
     const el = document.createElement('div');
     el.className = 'shot-card';
     el.innerHTML = `
-      <img class="shot-thumb" draggable="true" src="/api/thumb?path=${encodeURIComponent(m.path)}&w=480&v=${m.size}" title="新截图 · 可拖进终端">
+      <img class="shot-thumb" draggable="true" src="${thumbUrl(m.path, 480, m.size)}" title="新截图 · 可拖进终端">
       <div class="shot-info"><div class="shot-name">${escapeHtml(m.name)}</div>
       <div class="shot-acts">
         <button data-act="term" title="把路径喂给终端里的 agent">→ 终端</button>
