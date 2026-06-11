@@ -283,23 +283,6 @@ function updateWatches() {
 }
 // shell 单引号转义（用于把路径塞进终端 cd 命令）
 function shQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
-// ---------- Windows + WSL 路径互转 ----------
-// \\wsl.localhost\Ubuntu\home\x（或 \\wsl$\…）→ { distro: 'Ubuntu', lp: '/home/x' }；不是 WSL UNC 返回 null
-function wslOf(p) {
-  const m = /^[\\/]{2}(?:wsl\.localhost|wsl\$)[\\/]([^\\/]+)([\\/].*)?$/i.exec(p || '');
-  return m ? { distro: m[1], lp: ((m[2] || '/').replace(/\\/g, '/').replace(/\/+$/, '') || '/') } : null;
-}
-function uncOf(distro, lp) { return '\\\\wsl.localhost\\' + distro + String(lp).replace(/\//g, '\\'); }
-// 给终端会话用的路径形态：WSL 会话（bash）里 UNC 没意义，转回 Linux 路径；
-// 盘符路径也顺手转成 /mnt/c/… 形态（跟随浏览切去 Windows 目录时 cd 才有效）
-function pathForSess(p, sess) {
-  if (!sess || !sess.wsl) return p;
-  const w = wslOf(p);
-  if (w) return w.lp;
-  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p || '');
-  if (m) return '/mnt/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/');
-  return p;
-}
 function goBack() { if (state.history.length) navigate(state.history.pop(), false); }
 function goUp() { if (state.parent && state.parent !== state.cwd) navigate(state.parent); }
 
@@ -325,11 +308,9 @@ function renderBreadcrumb() {
   });
   // 项目配对色点：当前浏览目录落在某个终端的项目里 → 末级面包屑挂同款色，和终端标签图标呼应
   if (typeof term !== 'undefined' && term.sessions.length) {
-    const norm = (x) => String(x || '').replace(/\\/g, '/'); // Windows UNC/盘符路径统一成 / 形态再比
-    const cur = norm(state.cwd);
     const ts = term.sessions
       // 排掉 / 和家目录这类浅根：它们 startsWith 任何路径都成立，色点会常亮、配对语义失效
-      .filter((s) => s.cwd && s.cwd !== '/' && s.cwd !== state.home && (cur === norm(s.cwd) || cur.startsWith(norm(s.cwd).replace(/\/$/, '') + '/')))
+      .filter((s) => s.cwd && s.cwd !== '/' && s.cwd !== state.home && (state.cwd === s.cwd || (state.cwd || '').startsWith(s.cwd.replace(/\/$/, '') + '/')))
       .sort((a, b) => b.cwd.length - a.cwd.length)[0];
     if (ts) {
       const d = document.createElement('span');
@@ -615,11 +596,9 @@ function csvTable(text, delim) {
   h += '</tbody></table></div>';
   return h;
 }
-// 把绝对路径编码成 /fs/ 端点 URL，逐段 encode 以保留目录层级（相对引用按段解析）。
-// Windows：盘符路径成 /fs/C:/…，UNC 路径加 unc 前缀成 /fs/unc/wsl.localhost/…（服务端按此还原）
+// 把绝对路径编码成 /fs/ 端点 URL，逐段 encode 以保留目录层级（相对引用按段解析）
 function fsUrl(p, mtime) {
-  const segs = /^[\\/]{2}/.test(p) ? ['unc', ...p.slice(2).split(/[\\/]/)] : p.split(/[\\/]/);
-  return '/fs/' + segs.filter(Boolean).map(encodeURIComponent).join('/') + '?v=' + (mtime || 0);
+  return '/fs/' + p.split('/').filter(Boolean).map(encodeURIComponent).join('/') + '?v=' + (mtime || 0);
 }
 function renderHtmlPreview(data, meta) {
   const body = $('#preview-body');
@@ -2136,11 +2115,7 @@ const term = {
     if (!this.available()) { openWith(dirOf(p), 'terminal'); return; }
     const wasHidden = $('#terminal-panel').classList.contains('hidden');
     if (wasHidden) this.open();
-    const write = () => {
-      const s = this.sessions.find((x) => x.id === this.active);
-      if (this.active) this.input(this.active, shQuote(pathForSess(p, s)) + ' '); // WSL 会话里 UNC 转回 /home/… 形态
-      if (s) s.xterm.focus();
-    };
+    const write = () => { if (this.active) this.input(this.active, shQuote(p) + ' '); const s = this.sessions.find((x) => x.id === this.active); if (s) s.xterm.focus(); };
     if (wasHidden) setTimeout(write, 280); else write();
   },
   // 一键在终端启动 coding agent：当前标签是空闲 shell 就地启动；正跑着东西（claude/codex/任何前台程序）
@@ -2165,13 +2140,13 @@ const term = {
     else toast('终端启动失败', true);
   },
   // 该会话前台是不是裸 shell？判断不了一律按「不是」处理——宁可新开标签，也不往运行中的程序里打字。
-  // WSL 会话从 Windows 侧只能看到 wsl.exe 外壳：退而用 OSC7 的「刚画过提示符」信号判断空闲
+  // 取不到前台进程时退而用 OSC7 的「刚画过提示符」信号判断空闲
   async isPlainShell(s) {
     try {
       const r = await window.fanboxPty.proc(s.id);
-      const name = String((r && r.proc) || '').split(/[\\/]/).pop().replace(/^-/, '').toLowerCase();
-      if (['zsh', 'bash', 'fish', 'sh', 'dash', 'tcsh', 'nu', 'pwsh', 'powershell.exe', 'cmd.exe'].includes(name)) return true;
-      if (s.wsl || !r || !r.ok || !r.proc) return !!s.atPrompt;
+      const name = String((r && r.proc) || '').split('/').pop().replace(/^-/, '').toLowerCase();
+      if (['zsh', 'bash', 'fish', 'sh', 'dash', 'tcsh', 'nu'].includes(name)) return true;
+      if (!r || !r.ok || !r.proc) return !!s.atPrompt;
       return false;
     } catch { return !!s.atPrompt; }
   },
@@ -2208,15 +2183,14 @@ const term = {
   async openTermPath(id, raw, tail, rowHint) {
     let p = String(raw).replace(/^['"]+/, '').replace(/[)\]'"`,:;]+$/, '');
     const sess = this.sessions.find((x) => x.id === id);
-    const distro = (sess && sess.wsl && sess.wsl.distro) || ''; // WSL 会话：服务端把 / 和 ~ 开头的候选转成 UNC 再 stat
     let cwd = (sess && (sess.cwd || sess.startDir)) || state.cwd;
     let candidate = p;
-    const isRel = !p.startsWith('/') && !p.startsWith('~') && !/^([A-Za-z]:|\\\\)/.test(p);
+    const isRel = !p.startsWith('/') && !p.startsWith('~');
     if (isRel) {
       try { const r = await window.fanboxPty.cwd(id); if (r && r.ok && r.cwd) cwd = r.cwd; } catch { /* */ }
-      candidate = (cwd || '').replace(/[\\/]$/, '') + '/' + p.replace(/^\.\//, '');
+      candidate = (cwd || '').replace(/\/$/, '') + '/' + p.replace(/^\.\//, '');
     }
-    const name = p.split(/[\\/]/).pop();
+    const name = p.split('/').pop();
     // 回扫 scrollback：agent 生成文件时几乎总打印过全路径（裸文件名常常不在 cwd 下），比模糊搜索可信
     const alt = isRel ? this.scanScrollbackFor(id, name, rowHint) : '';
     // 活跃项目根（浏览目录 + 各终端项目目录）作 basename 搜索的额外根
@@ -2224,7 +2198,7 @@ const term = {
     if (state.cwd) roots.push(state.cwd);
     this.sessions.forEach((x) => { const d = x.cwd || x.startDir; if (d && !roots.includes(d)) roots.push(d); });
     const q = encodeURIComponent;
-    const r = await api(`/api/locate?path=${q(candidate)}&name=${q(name)}&root=${q(cwd || state.home)}&tail=${q(tail || '')}&alt=${q(alt)}&roots=${q(roots.join('\n'))}&distro=${q(distro)}`);
+    const r = await api(`/api/locate?path=${q(candidate)}&name=${q(name)}&root=${q(cwd || state.home)}&tail=${q(tail || '')}&alt=${q(alt)}&roots=${q(roots.join('\n'))}`);
     if (!r.found) { toast('没找到「' + name + '」', true); return; }
     if (r.isDir) { navigate(r.path); toast('已跳到该目录'); return; }
     await navigate(dirOf(r.path));
@@ -2268,8 +2242,7 @@ const term = {
   // 终端跟随浏览：把活动终端 cd 到指定目录
   syncCd(dir) {
     if (!this.active || !dir) return;
-    const s = this.sessions.find((x) => x.id === this.active);
-    this.input(this.active, 'cd ' + shQuote(pathForSess(dir, s)) + '\r');
+    this.input(this.active, 'cd ' + shQuote(dir) + '\r');
   },
   setFollow(on) {
     this.followBrowse = on;
@@ -2277,7 +2250,7 @@ const term = {
     $('#term-follow').classList.toggle('on', on);
     if (on && this.active && state.cwd) this.syncCd(state.cwd);
   },
-  // 定位文件区到活动终端的真实目录：lsof//proc 取不到（Windows）就用 OSC7 跟踪到的 cwd
+  // 定位文件区到活动终端的真实目录：lsof//proc 取不到就用 OSC7 跟踪到的 cwd
   async locateCwd() {
     if (!this.active) return;
     const s = this.sessions.find((x) => x.id === this.active);
@@ -2356,8 +2329,8 @@ const term = {
     if (fit) try { fit.fit(); } catch { /* */ }
     const sess = { id, xterm, fit, host, dead: false, status: 'idle', unread: false, startDir, title: baseOf(startDir || '') || 'shell' };
     this.sessions.push(sess);
-    // OSC 7 目录跟随：spawn 注入的 PROMPT_COMMAND（bash/WSL）或用户已有的终端集成（zsh/VS Code 等）
-    // 每次画提示符上报 $PWD。这是 Windows 上唯一的 cwd 来源；「刚画过提示符」也是空闲 shell 的可靠信号
+    // OSC 7 目录跟随：spawn 注入的 PROMPT_COMMAND（bash）或用户已有的终端集成（zsh/VS Code 等）
+    // 每次画提示符上报 $PWD；「刚画过提示符」也是空闲 shell 的可靠信号
     if (xterm.parser && xterm.parser.registerOscHandler) {
       xterm.parser.registerOscHandler(7, (data) => {
         const m = /^file:\/\/[^/]*(\/.*)$/.exec(String(data || ''));
@@ -2365,7 +2338,7 @@ const term = {
         let lp = m[1];
         try { lp = decodeURIComponent(lp); } catch { /* 未编码形态直接用 */ }
         sess.atPrompt = true;
-        const local = sess.wsl ? uncOf(sess.wsl.distro, lp) : lp; // WSL 会话上报的是 Linux 路径，导航用 UNC 形态
+        const local = lp;
         if (local !== sess.cwd) {
           sess.cwd = local;
           sess.title = baseOf(local) || sess.title;
@@ -2379,7 +2352,7 @@ const term = {
     updateWatches(); // 新终端的项目目录也纳入监听
     const r = await window.fanboxPty.spawn({ id, cwd: startDir, cols: xterm.cols, rows: xterm.rows });
     if (!r.ok) { sess.dead = true; xterm.write('\r\n  \x1b[31m终端启动失败：' + (r.error || '') + '\x1b[0m\r\n'); }
-    else { sess.cwd = r.cwd || startDir; sess.wsl = r.wsl || null; } // 末尾 renderTabs 统一带上 cwd 重画；wsl 标记供路径互转
+    else sess.cwd = r.cwd || startDir; // 末尾 renderTabs 统一带上 cwd 重画
     xterm.onData((d) => {
       if (sess.dead) { if (d === '\r' || d === '\n') this.respawn(sess); return; } // 进程退出后回车真重开
       this.input(id, d);
@@ -2476,7 +2449,7 @@ const term = {
             finish();
           };
           if (!need.length) { apply(); return; }
-          apiPost('/api/term-verify', { cwd: cwd0, distro: (sess0 && sess0.wsl && sess0.wsl.distro) || '', items: need.map((x) => ({ cand: x.cand, tail: x.tail })) }).then((res) => {
+          apiPost('/api/term-verify', { cwd: cwd0, items: need.map((x) => ({ cand: x.cand, tail: x.tail })) }).then((res) => {
             need.forEach((x, i) => this._vCache.set(cwd0 + ' ' + x.cand + ' ' + x.tail, !!(res.results && res.results[i])));
             if (this._vCache.size > 600) { for (const k of this._vCache.keys()) { this._vCache.delete(k); if (this._vCache.size <= 400) break; } }
             apply();
@@ -2492,7 +2465,7 @@ const term = {
     sess.xterm.reset(); // 清掉死亡残留，新 shell 提示符不和旧画面叠在一起
     const r = await window.fanboxPty.spawn({ id: sess.id, cwd: sess.startDir || state.cwd, cols: sess.xterm.cols, rows: sess.xterm.rows });
     if (!r.ok) { sess.dead = true; sess.xterm.write('\x1b[31m重开失败：' + (r.error || '') + '\x1b[0m\r\n'); }
-    else { sess.cwd = r.cwd || sess.startDir; sess.wsl = r.wsl || null; }
+    else sess.cwd = r.cwd || sess.startDir;
   },
   activate(id) {
     this.active = id;
@@ -2890,14 +2863,14 @@ async function invokeSkillInTerm(name) {
   let prefix = '/';
   try {
     const r = await window.fanboxPty.proc(s.id);
-    const pn = String((r && r.proc) || '').split(/[\\/]/).pop().replace(/^-/, '').toLowerCase();
+    const pn = String((r && r.proc) || '').split('/').pop().replace(/^-/, '').toLowerCase();
     if (pn.includes('codex')) prefix = '$';
     else if (['zsh', 'bash', 'fish', 'sh', 'dash', 'tcsh', 'nu'].includes(pn)) {
       toast('终端里还没启动 agent——先点 Claude / Codex 启动按钮', true);
       s.xterm.focus();
       return;
-    } else if (pn === 'wsl.exe' || !pn) {
-      // WSL 会话只能看到外壳进程：OSC7 说还在提示符 = 没启动 agent；启动过的按最近一次启动的来
+    } else if (!pn) {
+      // 取不到前台进程：OSC7 说还在提示符 = 没启动 agent；启动过的按最近一次启动的来
       if (s.atPrompt) { toast('终端里还没启动 agent——先点 Claude / Codex 启动按钮', true); s.xterm.focus(); return; }
       if (String(s.lastAgent || '').includes('codex')) prefix = '$';
     }
@@ -3279,7 +3252,7 @@ function installBrowserShims(termInfo) {
         ws.onmessage = (ev) => {
           let m; try { m = JSON.parse(ev.data); } catch { return; }
           if (m.t === 'd') handlers.data.forEach((cb) => cb({ id, data: m.d }));
-          else if (m.t === 'ready') { settled = true; resolve({ ok: true, cwd: m.cwd, wsl: m.wsl || null }); }
+          else if (m.t === 'ready') { settled = true; resolve({ ok: true, cwd: m.cwd }); }
           else if (m.t === 'exit') { ws.__exited = true; handlers.exit.forEach((cb) => cb({ id, exitCode: m.code })); }
           else if (m.t === 'err') { settled = true; ws.__exited = true; resolve({ ok: false, error: m.error }); }
         };

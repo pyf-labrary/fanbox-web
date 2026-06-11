@@ -112,22 +112,19 @@ Download the latest `.dmg` from [**Releases**](https://github.com/alchaincyf/fan
 node server.js
 ```
 
-Open `http://localhost:4567`. Zero build — clone and run. The embedded terminal works in the browser too: the server bridges node-pty over a zero-dependency WebSocket, so you can command Claude Code / Codex from the web UI just like the desktop app (`npm install --omit=dev` once for node-pty; without it everything else still works). Note: refreshing the page ends terminal sessions in the browser version.
+Open `http://localhost:4567`. Zero build — clone and run. The embedded terminal works in the browser too: the server bridges node-pty over a zero-dependency WebSocket, so you can command Claude Code / Codex from the web UI just like the desktop app (`npm install --omit=dev` once for node-pty; without it everything else still works). Terminal sessions survive page refreshes — the page reattaches and replays recent output.
 
-### Windows + WSL
+### WSL (recommended on Windows)
 
-FanBox runs on Windows and treats your WSL distros as first-class folders: each distro's home directory (`\\wsl.localhost\<distro>\`) shows up in the sidebar, and opening the embedded terminal inside a WSL folder drops you straight into the distro (`wsl.exe --cd`), so Claude Code / Codex run natively in WSL. Dragged paths are converted to Linux form automatically, and `/home/...` paths printed in the terminal are clickable.
+On Windows, run the server *inside* WSL and use FanBox from your Windows browser — agents run natively in Linux:
 
-Build the desktop app **on Windows** (node-pty is a native module and cannot be cross-compiled):
-
-```powershell
-npm install
-npm run rebuild      # compile node-pty for Electron (needs Visual Studio Build Tools)
-npm run app          # run from source, or:
-npm run dist:win     # build the NSIS installer (output in dist/)
+```bash
+# inside your WSL distro
+npm install --omit=dev   # once, for node-pty
+node server.js           # then open http://localhost:4567 in your Windows browser
 ```
 
-No build needed for the web version — double-click `启动翻箱.bat` (requires Node.js). Running `node server.js` *inside* WSL also works: open/reveal hand off to the Windows Explorer, and "open in terminal" launches Windows Terminal in the same directory.
+GUI actions hand off to the Windows side automatically: open/reveal goes to Windows Explorer / default apps (via `wslview`), and "open in system terminal" launches Windows Terminal in the same directory.
 
 ### Development
 
@@ -135,7 +132,6 @@ No build needed for the web version — double-click `启动翻箱.bat` (require
 npm install
 npm run app          # electron . — full desktop app
 npm run dist         # build & sign the .dmg (output in dist/, distributed via Releases)
-npm run dist:win     # Windows NSIS installer (run on Windows)
 ```
 
 > If the Electron download is blocked: `ELECTRON_MIRROR="https://registry.npmmirror.com/-/binary/electron/" npm run dist`
@@ -308,22 +304,19 @@ FanBox 把这条链路收进一个窗口：**左边文件 × 右边/下边终端
 node server.js
 ```
 
-浏览器打开 `http://localhost:4567`。零 build，clone 下来就能跑。内嵌终端在浏览器里同样可用：服务端把 node-pty 经零依赖 WebSocket 透传给网页 xterm，跑 Claude Code / Codex、拖路径喂 agent 与桌面版一致（首次 `npm install --omit=dev` 装上 node-pty；装不上其余功能照常）。注意：网页版刷新页面会结束终端会话。
+浏览器打开 `http://localhost:4567`。零 build，clone 下来就能跑。内嵌终端在浏览器里同样可用：服务端把 node-pty 经零依赖 WebSocket 透传给网页 xterm，跑 Claude Code / Codex、拖路径喂 agent 与桌面版一致（首次 `npm install --omit=dev` 装上 node-pty；装不上其余功能照常）。刷新页面不丢终端会话——重新打开页面会自动接回并回放最近输出。
 
-### Windows + WSL
+### WSL（Windows 用户推荐姿势）
 
-FanBox 支持 Windows，并把 WSL 当一等公民：各发行版的主目录（`\\wsl.localhost\<发行版>\`）自动出现在侧栏；在 WSL 文件夹里开内嵌终端会直接进发行版（`wsl.exe --cd`），Claude Code / Codex 在 WSL 里原生跑。拖拽插入的路径自动转成 Linux 形态，终端里打印的 `/home/…` 路径也能点击定位。
+Windows 上推荐把服务端跑在 WSL **里面**、用 Windows 浏览器访问——agent 原生跑在 Linux 里：
 
-桌面版需要**在 Windows 上**打包（node-pty 是原生模块，没法跨平台交叉编译）：
-
-```powershell
-npm install
-npm run rebuild      # 给 Electron 编译 node-pty（需要 Visual Studio Build Tools）
-npm run app          # 源码直接跑，或者：
-npm run dist:win     # 打 NSIS 安装包（产物在 dist/）
+```bash
+# 在你的 WSL 发行版里
+npm install --omit=dev   # 首次装 node-pty
+node server.js           # 然后在 Windows 浏览器打开 http://localhost:4567
 ```
 
-不想打包就用网页版：双击 `启动翻箱.bat`（需装 Node.js）。在 WSL **里面**直接 `node server.js` 也行：打开/定位文件会交给 Windows 侧资源管理器，「在终端打开」会起 Windows Terminal 进同目录。
+需要 GUI 的动作自动交给 Windows 侧：打开/定位文件走资源管理器/默认程序（`wslview`），「在系统终端打开」会起 Windows Terminal 进同目录。
 
 ### 开发模式
 
@@ -331,7 +324,6 @@ npm run dist:win     # 打 NSIS 安装包（产物在 dist/）
 npm install
 npm run app          # electron . 启动完整桌面版
 npm run dist         # 打包签名 .dmg（产物在 dist/，不入 git，统一走 Releases 分发）
-npm run dist:win     # Windows NSIS 安装包（需在 Windows 上跑）
 ```
 
 > 打包遇到 Electron 下载被墙：`ELECTRON_MIRROR="https://registry.npmmirror.com/-/binary/electron/" npm run dist`

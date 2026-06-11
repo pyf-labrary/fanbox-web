@@ -11,6 +11,15 @@
 
 ## [Unreleased]
 
+### Added
+- **浏览器版内嵌终端（TTY 透传）**：不打包也有完整终端——服务端 node-pty 经零依赖 WebSocket 透传到网页 xterm，跑 Claude Code / Codex、拖路径、点击文件路径定位与桌面版一致。安全面：WS 升级做 Host + Origin 双校验（WebSocket 不受 CORS 约束，不校验等于把 shell 暴露给任意网页）。node-pty 装不上时终端按钮给出安装提示并降级到系统终端，其余功能不受影响（首次 `npm install --omit=dev` 即可装上）
+- **浏览器版能力补齐**：文件变化自动刷新（SSE 推送，agent 改文件实时点亮）、系统文件拖入终端（字节落盘换路径）、复制图片到剪贴板（Clipboard API）
+- **WSL 浏览器模式**：服务端直接跑在 WSL 里（`node server.js`），Windows 浏览器访问——agent 原生跑在 Linux。需要 GUI 的动作转发给 Windows 侧：打开/定位文件走 wslview / explorer.exe，「在系统终端打开」起 Windows Terminal 进同目录，启动时自动用 Windows 默认浏览器打开页面
+- **终端目录跟随不再依赖 lsof（OSC 7 shell 集成）**：spawn 时给 bash 会话注入 PROMPT_COMMAND，每次提示符上报 $PWD——「定位到终端目录」「标签标题跟随」更可靠；zsh/VS Code 等已有 OSC 7 集成的直接受益。「刚画过提示符」同时作为空闲信号：一键启动 agent 能正确复用空闲 shell、skill 注入能识别「还没启动 agent」
+- 缩略图 Linux 支持：ImageMagick 缩图、视频帧走 ffmpeg（装了就用）；mac 维持 sips/qlmanage。生成不了照旧回退矢量图标
+- Linux 桌面版/服务端取终端 cwd 改为直读 /proc（不再依赖 lsof）
+- Linux 上删除文件没有装废纸篓工具（gio/trash-put/trash）时，兜底挪到 `~/.fanbox/trash/<时间戳>/`——同样可恢复，不永久删除
+
 ## [1.7.2] - 2026-06-11
 
 ### Changed
@@ -24,20 +33,6 @@
 ## [1.7.1] - 2026-06-11
 
 ### Added
-- **浏览器版内嵌终端（TTY 透传）**：不打包也有完整终端——服务端 node-pty 经零依赖 WebSocket 透传到网页 xterm，跑 Claude Code / Codex、拖路径、点击文件路径定位与桌面版一致。Windows 上打开 WSL 文件夹同样直接进发行版。安全面：WS 升级做 Host + Origin 双校验（WebSocket 不受 CORS 约束，不校验等于把 shell 暴露给任意网页）。node-pty 装不上时终端按钮给出安装提示并降级到系统终端，其余功能不受影响；启动脚本首次运行会自动 `npm install --omit=dev`。注意：浏览器版刷新页面会结束终端会话（桌面版不受影响）
-- **浏览器版能力补齐**：文件变化自动刷新（SSE 推送，agent 改文件实时点亮）、系统文件拖入终端（字节落盘换路径）、复制图片到剪贴板（Clipboard API）
-- **终端目录跟随不再依赖 lsof（OSC 7 shell 集成）**：spawn 时给 bash / WSL 会话注入 PROMPT_COMMAND（经 WSLENV 带进发行版），每次提示符上报 $PWD——Windows 上「定位到终端目录」「标签标题跟随」从此可用；zsh/VS Code 等已有 OSC 7 集成的直接受益。「刚画过提示符」同时作为空闲信号：WSL 会话里一键启动 agent 能正确复用空闲 shell、skill 注入能识别「还没启动 agent」
-- **缩略图跨平台**：Windows 用系统自带 PowerShell + System.Drawing 缩图，Linux 用 ImageMagick，视频帧两端走 ffmpeg（装了就用）；mac 维持 sips/qlmanage。生成不了照旧回退矢量图标
-- **Agent 用量 / Skills 触发统计多根聚合**：Windows 上把各 WSL 发行版的 `~/.claude`、`~/.codex` 会话日志一并计入；Claude 官方限额查询的 OAuth 凭证也会到 WSL 发行版里找
-- Linux 桌面版/服务端取终端 cwd 改为直读 /proc（不再依赖 lsof）
-- **Windows 版 + WSL 文件夹支持**：
-  - 打包目标新增 Windows（`npm run dist:win`，NSIS 安装包）；浏览器模式继续用 `启动翻箱.bat`
-  - 侧栏自动挂载各 WSL 发行版的主目录（`\\wsl.localhost\<发行版>\`），WSL 里的项目当本地文件夹浏览/搜索/预览/编辑
-  - 在 WSL 文件夹里开内嵌终端 = 直接进发行版（`wsl.exe --cd`），Claude Code / Codex 在 WSL 里原生跑；拖文件 / 跟随浏览 cd / 插入路径自动转成 Linux 路径形态，终端里打印的 `/home/…` 路径反向转换后照样能点击定位
-  - WSL 文件的「删除」进发行版自己的废纸篓（gio/trash-put，都没装则兜底挪到 `~/.fanbox/trash/`），不永久删除
-  - 磁盘占用透视对 WSL 目录改在发行版里跑原生 `du`（比走 9p 逐个 stat 快一个量级）；AI 整理对 WSL 目录调用发行版里装的 claude/codex
-  - 项目记忆 / Agent 项目 / Skills 透视同时扫描 Windows 本机和各 WSL 发行版的 `~/.claude`、`~/.codex`
-  - 翻箱直接跑在 WSL 里（`node server.js` 浏览器模式）也已适配：打开/定位文件走 Windows 侧（wslview / explorer.exe），「在终端打开」起 Windows Terminal 进同目录
 - 终端里的 http(s) 链接可直接点击，在系统浏览器打开
 
 ### Fixed
