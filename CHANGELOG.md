@@ -20,6 +20,10 @@
 - Linux 桌面版/服务端取终端 cwd 改为直读 /proc（不再依赖 lsof）
 - Linux 上删除文件没有装废纸篓工具（gio/trash-put/trash）时，兜底挪到 `~/.fanbox/trash/<时间戳>/`——同样可恢复，不永久删除
 
+### Fixed
+- 压缩包预览中文文件名乱码（#9）：不再用 `unzip -l`（它对没标 UTF-8 标志的条目按 locale 转码，GBK 名全成 ????），改为直接解析 zip central directory——文件名字节按通用标志位判 UTF-8，没标的先严格试 UTF-8、再按 GBK 解（Windows 中文环境打包的事实标准）。顺带支持 zip64，解析失败回退 unzip。zip 预览从此不依赖系统装没装 unzip
+- 透明图缩略图升级后仍显示白底（#1 回访）：v1.6.0 修复改了生成行为但缩略图 URL 没变（v=mtime 不变），浏览器按 7 天强缓存继续用修复前的白底 JPEG。给缩略图 URL 加管线版本号（THUMB_REV），版本一升旧缓存全部击穿
+
 ## [1.7.2] - 2026-06-11
 
 ### Changed

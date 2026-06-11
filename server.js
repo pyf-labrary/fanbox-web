@@ -799,7 +799,78 @@ async function diskUsage(p) {
   return { ok: true, dir, total, items: items.slice(0, 60), more: Math.max(0, items.length - 60) };
 }
 
-// 压缩包内容清单：全用系统自带工具（unzip / bsdtar / gzip），保持零依赖
+// ---------- zip 清单：自己读 central directory（#9 中文名乱码）----------
+// unzip -l 对没标 UTF-8 标志的条目按 locale 转码，GBK 文件名全成 ????。
+// zip 结构很简单：文件尾 EOCD 记录指向 central directory，逐条 entry 带文件名/原始大小。
+// 文件名字节自己解：GP bit 11 标了 UTF-8 就按 UTF-8；没标先严格试 UTF-8（很多打包器不标但实际是），
+// 失败按 GBK（Windows 中文环境打包的事实标准），TextDecoder 不支持 GBK 时退 latin1 至少不抛错。
+function strictUtf8(buf) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch { return null; }
+}
+let _gbkDecoder;
+function decodeGbk(buf) {
+  if (_gbkDecoder === undefined) { try { _gbkDecoder = new TextDecoder('gbk'); } catch { _gbkDecoder = null; } }
+  return _gbkDecoder ? _gbkDecoder.decode(buf) : buf.toString('latin1');
+}
+async function zipList(file, max) {
+  const fh = await fsp.open(file, 'r');
+  try {
+    const st = await fh.stat();
+    // EOCD（签名 0x06054b50）在文件尾部，zip 注释最长 65535 → 读尾部从后往前找
+    const tailLen = Math.min(st.size, 65557);
+    const tail = Buffer.alloc(tailLen);
+    await fh.read(tail, 0, tailLen, st.size - tailLen);
+    let eocd = -1;
+    for (let i = tailLen - 22; i >= 0; i--) {
+      if (tail.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd === -1) throw new Error('不是 zip（找不到 EOCD）');
+    let count = tail.readUInt16LE(eocd + 10);
+    let cdSize = tail.readUInt32LE(eocd + 12);
+    let cdOff = tail.readUInt32LE(eocd + 16);
+    if (count === 0xffff || cdSize === 0xffffffff || cdOff === 0xffffffff) {
+      // zip64：EOCD 紧前面是 locator（0x07064b50）→ 指向 zip64 EOCD（0x06064b50）
+      const loc = Buffer.alloc(20);
+      await fh.read(loc, 0, 20, st.size - tailLen + eocd - 20);
+      if (loc.readUInt32LE(0) !== 0x07064b50) throw new Error('zip64 缺 locator');
+      const z64 = Buffer.alloc(56);
+      await fh.read(z64, 0, 56, Number(loc.readBigUInt64LE(8)));
+      if (z64.readUInt32LE(0) !== 0x06064b50) throw new Error('zip64 缺 EOCD');
+      count = Number(z64.readBigUInt64LE(32));
+      cdSize = Number(z64.readBigUInt64LE(40));
+      cdOff = Number(z64.readBigUInt64LE(48));
+    }
+    if (cdSize > 64 * 1024 * 1024) throw new Error('central directory 过大');
+    const cd = Buffer.alloc(cdSize);
+    await fh.read(cd, 0, cdSize, cdOff);
+    const entries = [];
+    for (let i = 0, off = 0; i < count && off + 46 <= cd.length; i++) {
+      if (cd.readUInt32LE(off) !== 0x02014b50) break; // 中央目录条目签名
+      const flags = cd.readUInt16LE(off + 8);
+      let size = cd.readUInt32LE(off + 24); // 原始（未压缩）大小
+      const nameLen = cd.readUInt16LE(off + 28);
+      const extraLen = cd.readUInt16LE(off + 30);
+      const cmtLen = cd.readUInt16LE(off + 32);
+      const nameBuf = cd.subarray(off + 46, off + 46 + nameLen);
+      if (size === 0xffffffff) {
+        // zip64 大文件：真实大小在 extra field（header id 0x0001）里
+        const extra = cd.subarray(off + 46 + nameLen, off + 46 + nameLen + extraLen);
+        for (let e = 0; e + 4 <= extra.length;) {
+          const id = extra.readUInt16LE(e), len = extra.readUInt16LE(e + 2);
+          if (id === 0x0001 && len >= 8) { size = Number(extra.readBigUInt64LE(e + 4)); break; }
+          e += 4 + len;
+        }
+      }
+      const name = (flags & 0x800) ? nameBuf.toString('utf8') : (strictUtf8(nameBuf) ?? decodeGbk(nameBuf));
+      entries.push({ name, size });
+      if (entries.length > max) break;
+      off += 46 + nameLen + extraLen + cmtLen;
+    }
+    return entries;
+  } finally { await fh.close(); }
+}
+
+// 压缩包内容清单：zip 自解析（见上，#9），tar/gz 用系统自带工具——保持零依赖
 async function archiveList(p) {
   const file = resolvePath(p);
   try { await fsp.stat(file); } catch { return { ok: false, error: '文件不存在' }; }
@@ -811,14 +882,10 @@ async function archiveList(p) {
   const entries = [];
   try {
     if (/\.(zip|jar)$/.test(name)) {
-      if (PLATFORM === 'win32') {
-        // Windows 没有 unzip，但 Win10+ 自带的 tar 是 bsdtar，直接认 zip
-        const out = await run('tar', ['-tf', file]);
-        for (const line of out.split(/\r?\n/)) {
-          if (line.trim()) entries.push({ name: line });
-          if (entries.length > MAX) break;
-        }
-      } else {
+      try {
+        entries.push(...await zipList(file, MAX));
+      } catch {
+        // 自解析失败（损坏/奇异变体）：回退 unzip -l 兜底，至少 ASCII 名能看
         const out = await run('unzip', ['-l', '--', file]);
         for (const line of out.split('\n')) {
           const m = line.match(/^\s*(\d+)\s+\S+\s+\S+\s+(.+)$/);
