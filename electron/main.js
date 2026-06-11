@@ -42,10 +42,9 @@ function createWindow() {
   win = new BrowserWindow({
     width: b.width, height: b.height, x: b.x, y: b.y,
     minWidth: 920, minHeight: 600,
-    titleBarStyle: 'hiddenInset',
     backgroundColor: '#0b0c0a',
-    vibrancy: 'sidebar',
-    visualEffectState: 'active',
+    // 无边框沉浸标题栏 + 毛玻璃是 mac 专属；Windows/Linux 用系统标题栏
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset', vibrancy: 'sidebar', visualEffectState: 'active' } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -257,30 +256,43 @@ app.on('window-all-closed', () => {
 });
 
 // ---------- 终端 IPC（node-pty）----------
+// \\wsl.localhost\Ubuntu\home\x → { distro, linuxPath }；不是 WSL UNC 返回 null
+const WSL_UNC_RE = /^[\\/]{2}(?:wsl\.localhost|wsl\$)[\\/]([^\\/]+)([\\/].*)?$/i;
+function wslOfPath(p) {
+  const m = WSL_UNC_RE.exec(String(p || ''));
+  if (!m) return null;
+  return { distro: m[1], linuxPath: ((m[2] || '/').replace(/\\/g, '/').replace(/\/+$/, '') || '/') };
+}
+
 ipcMain.handle('pty:spawn', (e, { id, cwd, cols, rows }) => {
   if (!pty) return { ok: false, error: 'node-pty 未编译，跑：npm run rebuild' };
-  const shellPath = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
   const startCwd = cwd && fs.existsSync(cwd) ? cwd : os.homedir();
+  // Windows 下打开 WSL 文件夹：终端直接进发行版（agent 在 WSL 里原生跑），不开 PowerShell 看 UNC
+  const wsl = process.platform === 'win32' ? wslOfPath(startCwd) : null;
+  const shellPath = wsl ? 'wsl.exe'
+    : (process.platform === 'win32' ? 'powershell.exe' : (process.env.SHELL || '/bin/zsh'));
+  const shellArgs = wsl ? ['-d', wsl.distro, '--cd', wsl.linuxPath] : [];
   // GUI 启动的 app 不继承 shell 的 locale，zsh 会把中文路径按字节转义成 \M-^@ 乱码 → 兜底 UTF-8
   const env = { ...process.env, TERM: 'xterm-256color', FANBOX: '1' };
-  if (!/UTF-8/i.test(env.LC_ALL || env.LC_CTYPE || env.LANG || '')) env.LANG = 'zh_CN.UTF-8';
+  if (process.platform !== 'win32' && !/UTF-8/i.test(env.LC_ALL || env.LC_CTYPE || env.LANG || '')) env.LANG = 'zh_CN.UTF-8';
   let p;
   try {
-    p = pty.spawn(shellPath, [], {
+    p = pty.spawn(shellPath, shellArgs, {
       name: 'xterm-256color',
       cols: cols || 80,
       rows: rows || 24,
-      cwd: startCwd,
+      cwd: wsl ? os.homedir() : startCwd, // ConPTY 不接受 UNC cwd，目录交给 --cd
       env,
     });
   } catch (err) { return { ok: false, error: err.message }; }
   terminals.set(id, p);
+  if (wsl) p.fanboxWsl = { distro: wsl.distro };
   p.onData((data) => { if (win && !win.isDestroyed()) win.webContents.send('pty:data', { id, data }); });
   p.onExit(({ exitCode }) => {
     terminals.delete(id);
     if (win && !win.isDestroyed()) win.webContents.send('pty:exit', { id, exitCode });
   });
-  return { ok: true, cwd: startCwd };
+  return { ok: true, cwd: startCwd, wsl: wsl ? { distro: wsl.distro } : null };
 });
 // ---------- 剪贴板：复制图片本体 / 复制文件（访达可粘贴）----------
 ipcMain.handle('clip:image', (e, { path: p }) => {
@@ -289,6 +301,13 @@ ipcMain.handle('clip:image', (e, { path: p }) => {
 });
 ipcMain.handle('clip:file', (e, { path: p }) => new Promise((resolve) => {
   const { execFile } = require('child_process');
+  if (process.platform === 'win32') {
+    // Set-Clipboard -Path 写入文件型剪贴板，资源管理器可直接粘贴（UNC 也认）
+    execFile('powershell', ['-NoProfile', '-Command', 'Set-Clipboard', '-LiteralPath', `'${String(p).replace(/'/g, "''")}'`],
+      (err) => resolve({ ok: !err, error: err && err.message }));
+    return;
+  }
+  if (process.platform !== 'darwin') return resolve({ ok: false, error: '此平台暂不支持复制文件到剪贴板' });
   // argv 传路径，避免拼进 AppleScript 字面量被注入
   execFile('osascript', ['-e', 'on run argv', '-e', 'set the clipboard to (POSIX file (item 1 of argv))', '-e', 'end run', p], (err) => resolve({ ok: !err, error: err && err.message }));
 }));
@@ -326,7 +345,9 @@ function decodeLsofPath(s) {
   return Buffer.from(bytes).toString('utf8');
 }
 // 取某终端 shell 的真实当前目录（用 lsof 查 pty 子进程的 cwd），实现「定位到终端目录」
+// Windows 没有 lsof（WSL 会话的 cwd 在发行版里更拿不到）：返回 ok:false，前端保持启动目录
 ipcMain.handle('pty:cwd', (e, { id }) => new Promise((resolve) => {
+  if (process.platform === 'win32') return resolve({ ok: false });
   const p = terminals.get(id);
   if (!p || !p.pid) return resolve({ ok: false });
   const { exec } = require('child_process');

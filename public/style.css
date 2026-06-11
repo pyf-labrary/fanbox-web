@@ -830,8 +830,8 @@ kbd {
 .xterm-instance .xterm { height: 100%; }
 
 /* ---------- 桌面 app：交通灯避让 + 顶部可拖拽 ---------- */
-/* hiddenInset 标题栏的红绿灯坐在左上角，给侧栏 logo 让出空间（浏览器版无此问题，不受影响）*/
-.desktop #sidebar { padding-top: 40px; }
+/* hiddenInset 标题栏的红绿灯坐在左上角，给侧栏 logo 让出空间（仅 mac；浏览器版/Windows 版用系统标题栏，不受影响）*/
+.desktop-mac #sidebar { padding-top: 40px; }
 .desktop .brand { -webkit-app-region: drag; }
 /* 顶栏空白处也可拖窗，但其中的按钮/面包屑保持可点 */
 .desktop #topbar { -webkit-app-region: drag; }

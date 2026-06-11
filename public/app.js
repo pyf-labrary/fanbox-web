@@ -283,6 +283,23 @@ function updateWatches() {
 }
 // shell 单引号转义（用于把路径塞进终端 cd 命令）
 function shQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+// ---------- Windows + WSL 路径互转 ----------
+// \\wsl.localhost\Ubuntu\home\x（或 \\wsl$\…）→ { distro: 'Ubuntu', lp: '/home/x' }；不是 WSL UNC 返回 null
+function wslOf(p) {
+  const m = /^[\\/]{2}(?:wsl\.localhost|wsl\$)[\\/]([^\\/]+)([\\/].*)?$/i.exec(p || '');
+  return m ? { distro: m[1], lp: ((m[2] || '/').replace(/\\/g, '/').replace(/\/+$/, '') || '/') } : null;
+}
+function uncOf(distro, lp) { return '\\\\wsl.localhost\\' + distro + String(lp).replace(/\//g, '\\'); }
+// 给终端会话用的路径形态：WSL 会话（bash）里 UNC 没意义，转回 Linux 路径；
+// 盘符路径也顺手转成 /mnt/c/… 形态（跟随浏览切去 Windows 目录时 cd 才有效）
+function pathForSess(p, sess) {
+  if (!sess || !sess.wsl) return p;
+  const w = wslOf(p);
+  if (w) return w.lp;
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p || '');
+  if (m) return '/mnt/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/');
+  return p;
+}
 function goBack() { if (state.history.length) navigate(state.history.pop(), false); }
 function goUp() { if (state.parent && state.parent !== state.cwd) navigate(state.parent); }
 
@@ -308,9 +325,11 @@ function renderBreadcrumb() {
   });
   // 项目配对色点：当前浏览目录落在某个终端的项目里 → 末级面包屑挂同款色，和终端标签图标呼应
   if (typeof term !== 'undefined' && term.sessions.length) {
+    const norm = (x) => String(x || '').replace(/\\/g, '/'); // Windows UNC/盘符路径统一成 / 形态再比
+    const cur = norm(state.cwd);
     const ts = term.sessions
       // 排掉 / 和家目录这类浅根：它们 startsWith 任何路径都成立，色点会常亮、配对语义失效
-      .filter((s) => s.cwd && s.cwd !== '/' && s.cwd !== state.home && (state.cwd === s.cwd || (state.cwd || '').startsWith(s.cwd.replace(/\/$/, '') + '/')))
+      .filter((s) => s.cwd && s.cwd !== '/' && s.cwd !== state.home && (cur === norm(s.cwd) || cur.startsWith(norm(s.cwd).replace(/\/$/, '') + '/')))
       .sort((a, b) => b.cwd.length - a.cwd.length)[0];
     if (ts) {
       const d = document.createElement('span');
@@ -596,9 +615,11 @@ function csvTable(text, delim) {
   h += '</tbody></table></div>';
   return h;
 }
-// 把绝对路径编码成 /fs/ 端点 URL，逐段 encode 以保留目录层级（相对引用按段解析）
+// 把绝对路径编码成 /fs/ 端点 URL，逐段 encode 以保留目录层级（相对引用按段解析）。
+// Windows：盘符路径成 /fs/C:/…，UNC 路径加 unc 前缀成 /fs/unc/wsl.localhost/…（服务端按此还原）
 function fsUrl(p, mtime) {
-  return '/fs/' + p.split('/').filter(Boolean).map(encodeURIComponent).join('/') + '?v=' + (mtime || 0);
+  const segs = /^[\\/]{2}/.test(p) ? ['unc', ...p.slice(2).split(/[\\/]/)] : p.split(/[\\/]/);
+  return '/fs/' + segs.filter(Boolean).map(encodeURIComponent).join('/') + '?v=' + (mtime || 0);
 }
 function renderHtmlPreview(data, meta) {
   const body = $('#preview-body');
@@ -2109,7 +2130,11 @@ const term = {
     if (!this.available()) { openWith(dirOf(p), 'terminal'); return; }
     const wasHidden = $('#terminal-panel').classList.contains('hidden');
     if (wasHidden) this.open();
-    const write = () => { if (this.active) this.input(this.active, shQuote(p) + ' '); const s = this.sessions.find((x) => x.id === this.active); if (s) s.xterm.focus(); };
+    const write = () => {
+      const s = this.sessions.find((x) => x.id === this.active);
+      if (this.active) this.input(this.active, shQuote(pathForSess(p, s)) + ' '); // WSL 会话里 UNC 转回 /home/… 形态
+      if (s) s.xterm.focus();
+    };
     if (wasHidden) setTimeout(write, 280); else write();
   },
   // 一键在终端启动 coding agent：当前标签是空闲 shell 就地启动；正跑着东西（claude/codex/任何前台程序）
@@ -2173,14 +2198,16 @@ const term = {
   // rowHint：点击处逻辑行的末物理行号（buffer 绝对行），回扫 scrollback 的起点
   async openTermPath(id, raw, tail, rowHint) {
     let p = String(raw).replace(/^['"]+/, '').replace(/[)\]'"`,:;]+$/, '');
-    let cwd = state.cwd;
+    const sess = this.sessions.find((x) => x.id === id);
+    const distro = (sess && sess.wsl && sess.wsl.distro) || ''; // WSL 会话：服务端把 / 和 ~ 开头的候选转成 UNC 再 stat
+    let cwd = (sess && (sess.cwd || sess.startDir)) || state.cwd;
     let candidate = p;
-    const isRel = !p.startsWith('/') && !p.startsWith('~');
+    const isRel = !p.startsWith('/') && !p.startsWith('~') && !/^([A-Za-z]:|\\\\)/.test(p);
     if (isRel) {
       try { const r = await window.fanboxPty.cwd(id); if (r && r.ok && r.cwd) cwd = r.cwd; } catch { /* */ }
-      candidate = (cwd || '').replace(/\/$/, '') + '/' + p.replace(/^\.\//, '');
+      candidate = (cwd || '').replace(/[\\/]$/, '') + '/' + p.replace(/^\.\//, '');
     }
-    const name = p.split('/').pop();
+    const name = p.split(/[\\/]/).pop();
     // 回扫 scrollback：agent 生成文件时几乎总打印过全路径（裸文件名常常不在 cwd 下），比模糊搜索可信
     const alt = isRel ? this.scanScrollbackFor(id, name, rowHint) : '';
     // 活跃项目根（浏览目录 + 各终端项目目录）作 basename 搜索的额外根
@@ -2188,7 +2215,7 @@ const term = {
     if (state.cwd) roots.push(state.cwd);
     this.sessions.forEach((x) => { const d = x.cwd || x.startDir; if (d && !roots.includes(d)) roots.push(d); });
     const q = encodeURIComponent;
-    const r = await api(`/api/locate?path=${q(candidate)}&name=${q(name)}&root=${q(cwd || state.home)}&tail=${q(tail || '')}&alt=${q(alt)}&roots=${q(roots.join('\n'))}`);
+    const r = await api(`/api/locate?path=${q(candidate)}&name=${q(name)}&root=${q(cwd || state.home)}&tail=${q(tail || '')}&alt=${q(alt)}&roots=${q(roots.join('\n'))}&distro=${q(distro)}`);
     if (!r.found) { toast('没找到「' + name + '」', true); return; }
     if (r.isDir) { navigate(r.path); toast('已跳到该目录'); return; }
     await navigate(dirOf(r.path));
@@ -2232,7 +2259,8 @@ const term = {
   // 终端跟随浏览：把活动终端 cd 到指定目录
   syncCd(dir) {
     if (!this.active || !dir) return;
-    this.input(this.active, 'cd ' + shQuote(dir) + '\r');
+    const s = this.sessions.find((x) => x.id === this.active);
+    this.input(this.active, 'cd ' + shQuote(pathForSess(dir, s)) + '\r');
   },
   setFollow(on) {
     this.followBrowse = on;
@@ -2320,7 +2348,7 @@ const term = {
     updateWatches(); // 新终端的项目目录也纳入监听
     const r = await window.fanboxPty.spawn({ id, cwd: startDir, cols: xterm.cols, rows: xterm.rows });
     if (!r.ok) { sess.dead = true; xterm.write('\r\n  \x1b[31m终端启动失败：' + (r.error || '') + '\x1b[0m\r\n'); }
-    else sess.cwd = r.cwd || startDir; // 末尾 renderTabs 统一带上 cwd 重画
+    else { sess.cwd = r.cwd || startDir; sess.wsl = r.wsl || null; } // 末尾 renderTabs 统一带上 cwd 重画；wsl 标记供路径互转
     xterm.onData((d) => {
       if (sess.dead) { if (d === '\r' || d === '\n') this.respawn(sess); return; } // 进程退出后回车真重开
       this.input(id, d);
@@ -2417,7 +2445,7 @@ const term = {
             finish();
           };
           if (!need.length) { apply(); return; }
-          apiPost('/api/term-verify', { cwd: cwd0, items: need.map((x) => ({ cand: x.cand, tail: x.tail })) }).then((res) => {
+          apiPost('/api/term-verify', { cwd: cwd0, distro: (sess0 && sess0.wsl && sess0.wsl.distro) || '', items: need.map((x) => ({ cand: x.cand, tail: x.tail })) }).then((res) => {
             need.forEach((x, i) => this._vCache.set(cwd0 + ' ' + x.cand + ' ' + x.tail, !!(res.results && res.results[i])));
             if (this._vCache.size > 600) { for (const k of this._vCache.keys()) { this._vCache.delete(k); if (this._vCache.size <= 400) break; } }
             apply();
@@ -2433,7 +2461,7 @@ const term = {
     sess.xterm.reset(); // 清掉死亡残留，新 shell 提示符不和旧画面叠在一起
     const r = await window.fanboxPty.spawn({ id: sess.id, cwd: sess.startDir || state.cwd, cols: sess.xterm.cols, rows: sess.xterm.rows });
     if (!r.ok) { sess.dead = true; sess.xterm.write('\x1b[31m重开失败：' + (r.error || '') + '\x1b[0m\r\n'); }
-    else sess.cwd = r.cwd || sess.startDir;
+    else { sess.cwd = r.cwd || sess.startDir; sess.wsl = r.wsl || null; }
   },
   activate(id) {
     this.active = id;
@@ -3189,7 +3217,11 @@ if (window.fanboxFs) {
 // ---------- 启动 ----------
 async function init() {
   // 桌面 app：标记 body，给顶部交通灯留位、顶部可拖拽
-  if (window.fanboxEnv && window.fanboxEnv.isDesktopApp) document.documentElement.classList.add('desktop');
+  if (window.fanboxEnv && window.fanboxEnv.isDesktopApp) {
+    document.documentElement.classList.add('desktop');
+    // 红绿灯避让等 mac 专属样式单独挂类；Windows/Linux 桌面版用系统标题栏，不需要
+    if (window.fanboxEnv.platform === 'darwin') document.documentElement.classList.add('desktop-mac');
+  }
   applyTheme(state.theme, false);
   if (state.sidebarCollapsed) { $('#app').classList.add('sidebar-collapsed'); $('#btn-sidebar')?.classList.add('on'); }
   applyLayout();

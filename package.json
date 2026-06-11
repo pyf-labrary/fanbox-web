@@ -14,7 +14,9 @@
     "build:hljs": "esbuild src-vendor/hljs-entry.js --bundle --format=iife --minify --outfile=public/vendor/hljs/highlight.js && cp node_modules/marked/marked.min.js public/vendor/marked/marked.min.js && cp node_modules/highlight.js/styles/github-dark.min.css node_modules/highlight.js/styles/github.min.css public/vendor/hljs/styles/",
     "check:vendor-patch": "grep -q '20===e.keyCode||229===e.keyCode' public/vendor/xterm/xterm.js",
     "predist": "npm run check:vendor-patch",
-    "dist": "electron-builder --mac"
+    "dist": "electron-builder --mac",
+    "predist:win": "npm run check:vendor-patch",
+    "dist:win": "electron-builder --win"
   },
   "build": {
     "appId": "com.huashu.fanbox",
@@ -46,6 +48,20 @@
     "dmg": {
       "title": "FanBox",
       "writeUpdateInfo": false
+    },
+    "win": {
+      "icon": "build/icon-1024.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": "x64"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "翻箱 FanBox"
     }
   },
   "type": "commonjs",

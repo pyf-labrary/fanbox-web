@@ -24,6 +24,14 @@
 ## [1.7.1] - 2026-06-11
 
 ### Added
+- **Windows 版 + WSL 文件夹支持**：
+  - 打包目标新增 Windows（`npm run dist:win`，NSIS 安装包）；浏览器模式继续用 `启动翻箱.bat`
+  - 侧栏自动挂载各 WSL 发行版的主目录（`\\wsl.localhost\<发行版>\`），WSL 里的项目当本地文件夹浏览/搜索/预览/编辑
+  - 在 WSL 文件夹里开内嵌终端 = 直接进发行版（`wsl.exe --cd`），Claude Code / Codex 在 WSL 里原生跑；拖文件 / 跟随浏览 cd / 插入路径自动转成 Linux 路径形态，终端里打印的 `/home/…` 路径反向转换后照样能点击定位
+  - WSL 文件的「删除」进发行版自己的废纸篓（gio/trash-put，都没装则兜底挪到 `~/.fanbox/trash/`），不永久删除
+  - 磁盘占用透视对 WSL 目录改在发行版里跑原生 `du`（比走 9p 逐个 stat 快一个量级）；AI 整理对 WSL 目录调用发行版里装的 claude/codex
+  - 项目记忆 / Agent 项目 / Skills 透视同时扫描 Windows 本机和各 WSL 发行版的 `~/.claude`、`~/.codex`
+  - 翻箱直接跑在 WSL 里（`node server.js` 浏览器模式）也已适配：打开/定位文件走 Windows 侧（wslview / explorer.exe），「在终端打开」起 Windows Terminal 进同目录
 - 终端里的 http(s) 链接可直接点击，在系统浏览器打开
 
 ### Fixed

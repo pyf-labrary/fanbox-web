@@ -24,6 +24,53 @@ const THUMB_DIR = path.join(CONFIG_DIR, 'thumbs');
 const PUBLIC = path.join(__dirname, 'public');
 const PLATFORM = process.platform;
 
+// ---------- Windows + WSL ----------
+// 两种姿势都支持：① Windows 上跑翻箱、浏览 \\wsl.localhost\<发行版>\ 下的 WSL 文件夹；
+// ② 直接在 WSL 里跑翻箱（linux 平台），打开/定位等动作转发给 Windows 侧。
+const IS_WSL = PLATFORM === 'linux' && (!!process.env.WSL_DISTRO_NAME || /microsoft/i.test(os.release()));
+const WSL_UNC_RE = /^[\\/]{2}(?:wsl\.localhost|wsl\$)[\\/]([^\\/]+)([\\/].*)?$/i;
+
+// \\wsl.localhost\Ubuntu\home\x → { distro: 'Ubuntu', linuxPath: '/home/x' }；不是 WSL UNC 路径返回 null
+function wslOfPath(p) {
+  const m = WSL_UNC_RE.exec(String(p || ''));
+  if (!m) return null;
+  const lp = (m[2] || '/').replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+  return { distro: m[1], linuxPath: lp };
+}
+function uncOfLinux(distro, linuxPath) {
+  return `\\\\wsl.localhost\\${distro}` + String(linuxPath || '/').replace(/\//g, '\\');
+}
+// 在指定发行版里跑一条命令（argv 数组直传，不经 cmd 拼接）
+function wslExec(distro, argv, opts = {}) {
+  return new Promise((resolve) => {
+    execFile('wsl.exe', ['-d', distro, '-e', ...argv], { timeout: 15000, maxBuffer: 8 * 1024 * 1024, ...opts },
+      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: String(stderr || ''), err }));
+  });
+}
+// 枚举本机 WSL 发行版及各自主目录（UNC + Linux 两种形态）。结果进程级缓存：
+// wsl.exe -l 自己的输出是 UTF-16LE，必须按 buffer 解码；发行版里命令的输出才是 UTF-8
+let _wslRootsP = null;
+function wslRoots() {
+  if (PLATFORM !== 'win32') return Promise.resolve([]);
+  if (_wslRootsP) return _wslRootsP;
+  _wslRootsP = new Promise((resolve) => {
+    execFile('wsl.exe', ['-l', '-q'], { timeout: 8000, encoding: 'buffer' }, async (err, stdout) => {
+      if (err) return resolve([]);
+      const names = stdout.toString('utf16le').split(/\r?\n/).map((s) => s.replace(/\0/g, '').trim())
+        .filter((s) => s && !/docker-desktop/i.test(s));
+      const out = [];
+      await Promise.all(names.map(async (distro) => {
+        const r = await wslExec(distro, ['sh', '-c', 'echo "$HOME"']);
+        const linuxHome = r.ok ? r.stdout.trim() : '';
+        if (!linuxHome || !linuxHome.startsWith('/')) return;
+        out.push({ distro, linuxHome, home: uncOfLinux(distro, linuxHome) });
+      }));
+      resolve(out);
+    });
+  }).catch(() => []);
+  return _wslRootsP;
+}
+
 // 搜索 / 遍历时跳过的重目录，避免 vibe coding 项目里 node_modules 拖垮速度
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.next', 'dist', 'build', '.cache', '.venv', 'venv',
@@ -190,13 +237,23 @@ async function listDir(dirPath) {
     }));
   }
 
-  const parts = dir.split(path.sep).filter(Boolean);
-  const breadcrumb = [{ name: PLATFORM === 'win32' ? dir.split(path.sep)[0] : '/', path: PLATFORM === 'win32' ? parts[0] + path.sep : path.sep }];
-  let acc = PLATFORM === 'win32' ? parts[0] + path.sep : path.sep;
-  const start = PLATFORM === 'win32' ? 1 : 0;
-  for (let i = start; i < parts.length; i++) {
-    acc = path.join(acc, parts[i]);
-    breadcrumb.push({ name: parts[i], path: acc });
+  const wsl = PLATFORM === 'win32' ? wslOfPath(dir) : null;
+  let parts, breadcrumb, acc;
+  if (wsl) {
+    // WSL UNC：根显示为发行版名，逐段沿 Linux 路径展开
+    parts = wsl.linuxPath.split('/').filter(Boolean);
+    acc = `\\\\wsl.localhost\\${wsl.distro}`;
+    breadcrumb = [{ name: wsl.distro, path: acc + '\\' }];
+    for (const seg of parts) { acc += '\\' + seg; breadcrumb.push({ name: seg, path: acc }); }
+  } else {
+    parts = dir.split(path.sep).filter(Boolean);
+    breadcrumb = [{ name: PLATFORM === 'win32' ? dir.split(path.sep)[0] : '/', path: PLATFORM === 'win32' ? parts[0] + path.sep : path.sep }];
+    acc = PLATFORM === 'win32' ? parts[0] + path.sep : path.sep;
+    const start = PLATFORM === 'win32' ? 1 : 0;
+    for (let i = start; i < parts.length; i++) {
+      acc = path.join(acc, parts[i]);
+      breadcrumb.push({ name: parts[i], path: acc });
+    }
   }
   return { path: dir, parent: path.dirname(dir), entries, breadcrumb, project };
 }
@@ -439,6 +496,17 @@ function trashPath(p) {
     try { target = resolvePath(p); } catch { return resolve({ ok: false, error: '非法路径' }); }
     let isDir = false;
     try { isDir = fs.lstatSync(target).isDirectory(); } catch { return resolve({ ok: false, error: '文件不存在' }); }
+    const wsl = PLATFORM === 'win32' ? wslOfPath(target) : null;
+    if (wsl) {
+      // WSL 文件没有 Windows 回收站可去：进发行版自己的废纸篓（gio/trash-put），
+      // 都没装就移到 ~/.fanbox/trash/<时间戳>/ 兜底——同样可恢复，不永久删除
+      const sh = 'command -v gio >/dev/null 2>&1 && gio trash -- "$1" && exit 0;'
+        + 'command -v trash-put >/dev/null 2>&1 && trash-put -- "$1" && exit 0;'
+        + 'd="$HOME/.fanbox/trash/$(date +%s)"; mkdir -p "$d" && mv -- "$1" "$d/"';
+      wslExec(wsl.distro, ['sh', '-c', sh, 'sh', wsl.linuxPath])
+        .then((r) => resolve(r.ok ? { ok: true } : { ok: false, error: (r.stderr || (r.err && r.err.message) || '删除失败').slice(0, 300) }));
+      return;
+    }
     let cmd;
     if (PLATFORM === 'darwin') {
       // 路径走 argv，不拼进单引号 AppleScript 字面量——避免含 ' 的文件名删除失败/注入
@@ -496,8 +564,17 @@ const DEFAULT_ORGANIZE_STRATEGY = `- 默认归档：过时/低频的文件移入
 
 async function findAgentBin(name) {
   // GUI 启动的 app 没有用户 shell 的 PATH，走登录 shell 找一次绝对路径
+  if (PLATFORM === 'win32') {
+    return new Promise((resolve) => {
+      execFile('where.exe', [name], { timeout: 8000 }, (err, stdout) => {
+        const out = String(stdout || '').trim().split(/\r?\n/)[0];
+        resolve(!err && out ? out : null);
+      });
+    });
+  }
+  const sh = PLATFORM === 'darwin' ? '/bin/zsh' : (process.env.SHELL || '/bin/bash');
   return new Promise((resolve) => {
-    execFile('/bin/zsh', ['-lc', `command -v ${name}`], { timeout: 8000 }, (err, stdout) => {
+    execFile(sh, ['-lc', `command -v ${name}`], { timeout: 8000 }, (err, stdout) => {
       const out = String(stdout || '').trim().split('\n').pop();
       resolve(!err && out && out.startsWith('/') ? out : null);
     });
@@ -581,7 +658,7 @@ async function releaseInspect(p) {
   const status = await sh('git', ['status', '--porcelain']);
   out.isRepo = status !== null;
   out.dirty = !!(status && status.length);
-  out.gh = !!(await sh('/bin/sh', ['-lc', 'command -v gh']));
+  out.gh = PLATFORM === 'win32' ? !!(await sh('where.exe', ['gh'])) : !!(await sh('/bin/sh', ['-lc', 'command -v gh']));
   out.unreleased = ''; out.hasChangelog = false;
   try {
     const cl = await fsp.readFile(path.join(dir, 'CHANGELOG.md'), 'utf8');
@@ -727,9 +804,15 @@ async function parseCodexSession(fp, st) {
 async function projectMemory(p) {
   const cwd = resolvePath(p);
   const sessions = [];
+  // WSL 目录：会话日志在发行版自己的 ~/.claude / ~/.codex 里，且记录的 cwd 是 Linux 路径
+  const wsl = PLATFORM === 'win32' ? wslOfPath(cwd) : null;
+  const wslHome = wsl ? (await wslRoots()).find((x) => x.distro === wsl.distro) : null;
+  const claudeProj = wslHome ? path.join(wslHome.home, '.claude', 'projects') : CLAUDE_PROJ;
+  const codexSess = wslHome ? path.join(wslHome.home, '.codex', 'sessions') : CODEX_SESS;
+  const matchCwd = wsl ? wsl.linuxPath : cwd;
   // Claude Code：项目目录名就是 munge 过的 cwd，正向算一遍直达
   try {
-    const base = path.join(CLAUDE_PROJ, mungeClaudeDir(cwd));
+    const base = path.join(claudeProj, mungeClaudeDir(matchCwd));
     const names = (await fsp.readdir(base)).filter((n) => n.endsWith('.jsonl'));
     const stats = (await Promise.all(names.map(async (n) => {
       const fp = path.join(base, n);
@@ -751,10 +834,10 @@ async function projectMemory(p) {
         }
       }
     };
-    await walk(CODEX_SESS, 0);
+    await walk(codexSess, 0);
     files.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
     for (const { fp, st } of files.slice(0, 60)) {
-      try { if ((await readCwdFromHead(fp, 16384)) === cwd) sessions.push(await parseCodexSession(fp, st)); } catch { /* */ }
+      try { if ((await readCwdFromHead(fp, 16384)) === matchCwd) sessions.push(await parseCodexSession(fp, st)); } catch { /* */ }
     }
   } catch { /* 没用过 Codex */ }
   // 没有正经标题的会话（纯 warmup / 空会话）沉底，按最近活跃排
@@ -775,7 +858,33 @@ async function diskUsage(p) {
     if (d.isDirectory() && !d.isSymbolicLink()) { dirs.push(full); return; }
     try { const st = await fsp.lstat(full); if (st.isFile()) items.push({ name: d.name, size: st.size, isDir: false }); } catch { /* */ }
   }));
-  if (dirs.length) {
+  const wsl = PLATFORM === 'win32' ? wslOfPath(dir) : null;
+  if (dirs.length && wsl) {
+    // WSL 目录：du 进发行版里跑（原生文件系统），比从 Windows 侧走 9p 逐个 stat 快一个量级
+    const linuxDirs = dirs.map((d) => wslOfPath(d)).filter(Boolean).map((w) => w.linuxPath);
+    const r = await wslExec(wsl.distro, ['du', '-sk', ...linuxDirs], { timeout: 120000 });
+    for (const line of r.stdout.split('\n')) {
+      const m = line.match(/^(\d+)\s+(.+)$/);
+      if (m) items.push({ name: m[2].split('/').filter(Boolean).pop() || m[2], size: Number(m[1]) * 1024, isDir: true });
+    }
+  } else if (dirs.length && PLATFORM === 'win32') {
+    // Windows 没有 du：JS 递归累加（深目录会慢，但够用且零依赖）
+    const sizeOf = async (d) => {
+      let total = 0;
+      const stack = [d];
+      while (stack.length) {
+        const cur = stack.pop();
+        let ents; try { ents = await fsp.readdir(cur, { withFileTypes: true }); } catch { continue; }
+        for (const e of ents) {
+          const fp = path.join(cur, e.name);
+          if (e.isDirectory() && !e.isSymbolicLink()) stack.push(fp);
+          else { try { total += (await fsp.lstat(fp)).size; } catch { /* */ } }
+        }
+      }
+      return total;
+    };
+    await Promise.all(dirs.map(async (d) => items.push({ name: path.basename(d), size: await sizeOf(d), isDir: true })));
+  } else if (dirs.length) {
     const out = await new Promise((resolve) => {
       execFile('du', ['-sk', ...dirs], { timeout: 120000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => resolve(stdout || ''));
     });
@@ -801,11 +910,20 @@ async function archiveList(p) {
   const entries = [];
   try {
     if (/\.(zip|jar)$/.test(name)) {
-      const out = await run('unzip', ['-l', '--', file]);
-      for (const line of out.split('\n')) {
-        const m = line.match(/^\s*(\d+)\s+\S+\s+\S+\s+(.+)$/);
-        if (m) entries.push({ name: m[2], size: Number(m[1]) });
-        if (entries.length > MAX) break;
+      if (PLATFORM === 'win32') {
+        // Windows 没有 unzip，但 Win10+ 自带的 tar 是 bsdtar，直接认 zip
+        const out = await run('tar', ['-tf', file]);
+        for (const line of out.split(/\r?\n/)) {
+          if (line.trim()) entries.push({ name: line });
+          if (entries.length > MAX) break;
+        }
+      } else {
+        const out = await run('unzip', ['-l', '--', file]);
+        for (const line of out.split('\n')) {
+          const m = line.match(/^\s*(\d+)\s+\S+\s+\S+\s+(.+)$/);
+          if (m) entries.push({ name: m[2], size: Number(m[1]) });
+          if (entries.length > MAX) break;
+        }
       }
     } else if (/\.(tar|tgz|tbz2?|txz)$/.test(name) || /\.tar\.(gz|bz2|xz|zst)$/.test(name)) {
       const out = await run('tar', ['-tf', file]); // bsdtar 自动识别压缩格式
@@ -886,29 +1004,40 @@ async function statWithTail(p, tail) {
   return null;
 }
 
+// Windows 上的 WSL 终端会话：会话里打印的是 Linux 绝对路径 / ~ 路径，转成 UNC 才能在本侧 stat
+async function normTermPath(p, distro) {
+  if (PLATFORM !== 'win32' || !distro || typeof p !== 'string') return p;
+  if (p.startsWith('/')) return uncOfLinux(distro, p);
+  if (p.startsWith('~')) {
+    const w = (await wslRoots()).find((x) => x.distro === distro);
+    if (w) return uncOfLinux(distro, w.linuxHome + p.slice(1));
+  }
+  return p;
+}
+
 // 终端划线前的批量验证：候选路径 stat 得到才配下划线，中文散文里的「分发/产品演示」不再误标
 async function termVerify(b) {
   const cwd = b.cwd ? resolvePath(b.cwd) : HOME;
   const items = Array.isArray(b.items) ? b.items.slice(0, 24) : [];
   const results = await Promise.all(items.map(async (it) => {
     if (!it || typeof it.cand !== 'string') return false;
-    let p = it.cand;
-    if (!p.startsWith('/') && !p.startsWith('~')) p = cwd.replace(/\/$/, '') + '/' + p.replace(/^\.\//, '');
+    let p = await normTermPath(it.cand, b.distro);
+    if (!p.startsWith('/') && !p.startsWith('~') && !path.isAbsolute(p)) p = cwd.replace(/[\\/]$/, '') + '/' + p.replace(/^\.\//, '');
     return !!(await statWithTail(p, it.tail || ''));
   }));
   return { ok: true, results };
 }
 
-async function locatePath(p, name, root, tail, alt, roots) {
+async function locatePath(p, name, root, tail, alt, roots, distro) {
   const tryStat = async (cand) => {
     try { const real = resolvePath(cand); const st = await fsp.stat(real); return { found: true, path: real, isDir: st.isDirectory() }; }
     catch { return null; }
   };
-  const direct = await statWithTail(p, tail);
+  const direct = await statWithTail(await normTermPath(p, distro), tail);
   if (direct) return direct;
   // scrollback 回扫候选（最近出现在前）：stat 验证，命中即信——它来自 agent 自己打印的全路径
   for (const a of String(alt || '').split('\n').filter(Boolean).slice(0, 3)) {
-    const hit = await tryStat(a);
+    const hit = await tryStat(await normTermPath(a, distro));
     if (hit) return { ...hit, viaScrollback: true };
   }
   if (name) {
@@ -1000,8 +1129,11 @@ function openInOS(target, withApp) {
     if (withApp === 'terminal') {
       // 在该目录（文件则取其所在目录）打开系统终端，找回项目后一键去跑
       const dir = (() => { try { return fs.statSync(target).isDirectory() ? target : path.dirname(target); } catch { return path.dirname(target); } })();
+      const wsl = PLATFORM === 'win32' ? wslOfPath(dir) : null;
       if (PLATFORM === 'darwin') cmd = `open -a Terminal ${shellQuote(dir)}`;
+      else if (wsl) cmd = `wt.exe wsl.exe -d "${wsl.distro}" --cd "${wsl.linuxPath}" || start "" wsl.exe -d "${wsl.distro}" --cd "${wsl.linuxPath}"`; // 优先 Windows Terminal，没装退回 conhost
       else if (PLATFORM === 'win32') cmd = `start "" cmd /K cd /d "${dir}"`;
+      else if (IS_WSL) cmd = `wt.exe wsl.exe --cd ${shellQuote(dir)} || cmd.exe /c start wsl.exe --cd ${shellQuote(dir)}`; // 翻箱跑在 WSL 里：开 Windows 侧终端进同目录
       else cmd = `x-terminal-emulator --working-directory=${shellQuote(dir)} || gnome-terminal --working-directory=${shellQuote(dir)} || xterm`;
       exec(cmd, (err) => resolve(err ? { ok: false, error: err.message } : { ok: true, with: 'terminal' }));
       return;
@@ -1029,8 +1161,13 @@ function openDefault(target, withApp) {
       if (withApp === 'reveal') cmd = `open -R ${shellQuote(target)}`;
       else cmd = `open ${shellQuote(target)}`;
     } else if (PLATFORM === 'win32') {
-      if (withApp === 'reveal') cmd = `explorer /select,"${target}"`;
-      else cmd = `start "" "${target}"`;
+      // explorer 对 \\wsl.localhost\ UNC 一样认；它无论成败都返回非零退出码，单独按成功处理
+      if (withApp === 'reveal') { exec(`explorer /select,"${target}"`, () => resolve({ ok: true, with: 'reveal' })); return; }
+      cmd = `start "" "${target}"`;
+    } else if (IS_WSL) {
+      // 翻箱跑在 WSL 里：用 Windows 侧资源管理器/默认程序打开（wslpath 转成 \\wsl.localhost\ 路径）
+      if (withApp === 'reveal') { exec(`explorer.exe /select,"$(wslpath -w ${shellQuote(target)})"`, () => resolve({ ok: true, with: 'reveal' })); return; }
+      cmd = `wslview ${shellQuote(target)} || explorer.exe "$(wslpath -w ${shellQuote(target)})"`;
     } else {
       if (withApp === 'reveal') cmd = `xdg-open ${shellQuote(path.dirname(target))}`;
       else cmd = `xdg-open ${shellQuote(target)}`;
@@ -1046,7 +1183,7 @@ function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
-function defaultRoots() {
+async function defaultRoots() {
   const candidates = [
     ['主目录', HOME],
     ['桌面', path.join(HOME, 'Desktop')],
@@ -1056,9 +1193,12 @@ function defaultRoots() {
     ['项目 / Projects', path.join(HOME, 'Projects')],
     ['Developer', path.join(HOME, 'Developer')],
   ];
-  return candidates
+  const roots = candidates
     .filter(([, p]) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } })
     .map(([name, p]) => ({ name, path: p }));
+  // Windows 上把各 WSL 发行版的主目录挂进侧栏，WSL 里的项目当本地文件夹用
+  for (const w of await wslRoots()) roots.push({ name: `${w.distro} (WSL)`, path: w.home });
+  return roots;
 }
 
 // ---------- 静态资源 ----------
@@ -1408,11 +1548,23 @@ async function agentProjects() {
     cur.agents.add(agent);
     map.set(cwd, cur);
   };
+  // 数据源：本机 home + Windows 上的各 WSL 发行版 home（后者记录的 cwd 是 Linux 路径，转成 UNC）
+  const sources = [{ claudeProj: CLAUDE_PROJ, codexSess: CODEX_SESS, conv: (c) => c }];
+  if (PLATFORM === 'win32') {
+    for (const w of await wslRoots()) {
+      sources.push({
+        claudeProj: path.join(w.home, '.claude', 'projects'),
+        codexSess: path.join(w.home, '.codex', 'sessions'),
+        conv: (c) => (c && c.startsWith('/') ? uncOfLinux(w.distro, c) : c),
+      });
+    }
+  }
+  for (const src of sources) {
   // Claude Code：每个项目目录取最新的 jsonl，从文件头抓 cwd
   try {
-    const dirs = await fsp.readdir(CLAUDE_PROJ);
+    const dirs = await fsp.readdir(src.claudeProj);
     await Promise.all(dirs.map(async (d) => {
-      const base = path.join(CLAUDE_PROJ, d);
+      const base = path.join(src.claudeProj, d);
       let names; try { names = await fsp.readdir(base); } catch { return; }
       let newest = null;
       await Promise.all(names.filter((n) => n.endsWith('.jsonl')).map(async (n) => {
@@ -1422,7 +1574,7 @@ async function agentProjects() {
         } catch { /* */ }
       }));
       if (!newest || newest.mtimeMs < cutoff) return;
-      try { add(await readCwdFromHead(newest.fp, 65536), newest.mtimeMs, 'claude'); } catch { /* */ }
+      try { add(src.conv(await readCwdFromHead(newest.fp, 65536)), newest.mtimeMs, 'claude'); } catch { /* */ }
     }));
   } catch { /* 没用过 Claude Code */ }
   // Codex：最近改动的 rollout 文件头部抓 cwd（数量封顶，控制 IO）
@@ -1439,12 +1591,13 @@ async function agentProjects() {
         }
       }
     };
-    await walk(CODEX_SESS, 0);
+    await walk(src.codexSess, 0);
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
     await Promise.all(files.slice(0, 40).map(async (f) => {
-      try { add(await readCwdFromHead(f.fp, 16384), f.mtimeMs, 'codex'); } catch { /* */ }
+      try { add(src.conv(await readCwdFromHead(f.fp, 16384)), f.mtimeMs, 'codex'); } catch { /* */ }
     }));
   } catch { /* 没用过 Codex */ }
+  }
   // 按最近活跃排序，已被删除的项目目录剔掉
   const sorted = [...map.entries()].sort((a, b) => b[1].lastActive - a[1].lastActive);
   const projects = [];
@@ -1638,6 +1791,14 @@ async function skillsData() {
   await scanSkillRoot(CLAUDE_SKILLS, 'claude', '~/.claude', items);
   await scanSkillRoot(CODEX_SKILLS, 'codex', '~/.codex', items);
   await scanSkillRoot(AGENTS_SKILLS, 'agents', '~/.agents', items);
+  // Windows 上把各 WSL 发行版的 skills 也扫进来（触发统计仍只读本机日志，WSL 侧的次数不计）
+  if (PLATFORM === 'win32') {
+    for (const w of await wslRoots()) {
+      await scanSkillRoot(path.join(w.home, '.claude', 'skills'), 'claude', `${w.distro} ~/.claude`, items);
+      await scanSkillRoot(path.join(w.home, '.codex', 'skills'), 'codex', `${w.distro} ~/.codex`, items);
+      await scanSkillRoot(path.join(w.home, '.agents', 'skills'), 'agents', `${w.distro} ~/.agents`, items);
+    }
+  }
   // Claude 插件自带的 skills
   try {
     const inst = JSON.parse(await fsp.readFile(path.join(HOME, '.claude', 'plugins', 'installed_plugins.json'), 'utf8'));
@@ -1790,7 +1951,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (p === '/api/roots') {
-      return sendJSON(res, 200, { home: HOME, platform: PLATFORM, sep: path.sep, roots: defaultRoots() });
+      return sendJSON(res, 200, { home: HOME, platform: PLATFORM, sep: path.sep, isWsl: IS_WSL, roots: await defaultRoots() });
     }
     if (p === '/api/list') {
       return sendJSON(res, 200, await listDir(qp.get('path') || HOME));
@@ -1806,7 +1967,13 @@ const server = http.createServer(async (req, res) => {
     // 都能按所在目录正确解析——srcdoc 方案没有 base URL，这些全是裂的。
     // 暴露面与 /api/raw 等价（都接受任意绝对路径），且同样只对本机回环开放。
     if (p.startsWith('/fs/')) {
-      return serveRaw(req, res, decodeURIComponent(p.slice(3)));
+      let fsPath = decodeURIComponent(p.slice(3));
+      if (PLATFORM === 'win32') {
+        // 前端按段编码：盘符路径成 /C:/Users/...，UNC 路径成 /unc/wsl.localhost/Ubuntu/...
+        if (/^\/unc\//i.test(fsPath)) fsPath = '\\\\' + fsPath.slice(5).replace(/\//g, '\\');
+        else if (/^\/[A-Za-z]:/.test(fsPath)) fsPath = fsPath.slice(1);
+      }
+      return serveRaw(req, res, fsPath);
     }
     if (p === '/api/thumb') {
       return serveThumb(req, res, qp.get('path'), parseInt(qp.get('w') || '240', 10));
@@ -1828,7 +1995,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/locate') {
       const extraRoots = String(qp.get('roots') || '').split('\n').filter(Boolean).slice(0, 3);
-      return sendJSON(res, 200, await locatePath(qp.get('path'), qp.get('name'), qp.get('root'), qp.get('tail'), qp.get('alt'), extraRoots));
+      return sendJSON(res, 200, await locatePath(qp.get('path'), qp.get('name'), qp.get('root'), qp.get('tail'), qp.get('alt'), extraRoots, qp.get('distro') || ''));
     }
     if (p === '/api/git') {
       return sendJSON(res, 200, await gitStatus(qp.get('path') || HOME));
