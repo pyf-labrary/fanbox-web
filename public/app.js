@@ -593,8 +593,32 @@ function cursorEnter(editor) {
   else { applySelection(e.path); openPreview(e); recordRecent(e.path); }
 }
 
+// ---------- 预览方式记忆：无法预览的类型，用户可选「以 X 格式预览」并按扩展名记住 ----------
+const KIND_LABEL = { text: '文本', image: '图像', video: '视频', audio: '音频', pdf: 'PDF' };
+const PREVIEW_AS = ['text', 'image', 'video', 'audio', 'pdf']; // 可选的回退预览格式
+function getKindOverride(ex) {
+  if (!ex) return null;
+  try { return JSON.parse(localStorage.getItem('fb_preview_kind') || '{}')[ex] || null; } catch { return null; }
+}
+function setKindOverride(ex, k) {
+  if (!ex) return;
+  try {
+    const m = JSON.parse(localStorage.getItem('fb_preview_kind') || '{}');
+    if (k) m[ex] = k; else delete m[ex];
+    localStorage.setItem('fb_preview_kind', JSON.stringify(m));
+  } catch { /* localStorage 不可用就不记，功能照常 */ }
+}
+const extOf = (n) => { const s = String(n || ''); const i = s.lastIndexOf('.'); return i > 0 ? s.slice(i + 1).toLowerCase() : ''; };
+function fmtDuration(sec) {
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const p = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${p(m)}:${p(s)}` : `${m}:${p(s)}`;
+}
+
 // ---------- 预览 ----------
-async function openPreview(e) {
+// forceKind：用户在「无法预览」里选了某个格式（本次或记住的）→ 强制按该 kind 渲染
+async function openPreview(e, forceKind) {
   if (!await guardDirty()) return;
   mona.disposeIfAny(); crepe.disposeIfAny(); imgEditState = null; // 离开编辑态时回收编辑器（连带 worker），避免泄漏
   showPreviewPanel();
@@ -602,8 +626,13 @@ async function openPreview(e) {
   const body = $('#preview-body');
   body.innerHTML = '<div class="cmdk-loading">加载中…</div>';
   renderPreviewActions(e);
-  renderPreviewFoot(e);
-  const k = e.kind;
+  const ex = extOf(e.name);
+  const pkey = ex || e.name.toLowerCase(); // 记忆键：有扩展名按扩展名，没有就按文件名
+  const klabel = ex ? '.' + ex : e.name;   // 展示用：.jsonl / 或无扩展名时直接文件名
+  const ov = getKindOverride(pkey);         // 记住的预览方式
+  const forced = forceKind || ov;            // 本次（点选）或记住的强制格式
+  const k = forceKind || ov || e.kind;       // 实际用来渲染的 kind
+  renderPreviewFoot(e, { kind: k, pkey, klabel, savedOverride: ov });
   if (k === 'image') {
     // 预览用中等缩略图（秒开）。heic/heif/tiff 浏览器无法直接渲染原图，统一走 sips 缩略图端点
     const exi = (e.name.split('.').pop() || '').toLowerCase();
@@ -618,9 +647,13 @@ async function openPreview(e) {
   } else if (k === 'pdf') {
     body.innerHTML = `<iframe class="iframe-preview" src="/api/raw?path=${encodeURIComponent(e.path)}"></iframe>`;
   } else if (k === 'text') {
-    // 代码/文本「预览即编辑」：像 md 一样默认进可编辑态，不用再点编辑按钮。
-    // html 例外（给人看的是渲染形态）、csv/tsv 例外（表格视图更有用）→ 仍走只读渲染。
-    if (isHtmlName(e.name) || /\.(csv|tsv)$/i.test(e.name)) {
+    if (forced && e.kind !== 'text') {
+      // 强制以文本预览（如 .jsonl 选了「文本」）：只读渲染、不进编辑器，
+      // 免得把本不是文本的文件在编辑器里误存盘写坏
+      renderTextPreview(await api('/api/read?path=' + encodeURIComponent(e.path) + '&as=text'));
+    } else if (isHtmlName(e.name) || /\.(csv|tsv)$/i.test(e.name)) {
+      // 代码/文本「预览即编辑」：像 md 一样默认进可编辑态，不用再点编辑按钮。
+      // html 例外（给人看的是渲染形态）、csv/tsv 例外（表格视图更有用）→ 仍走只读渲染。
       renderTextPreview(await api('/api/read?path=' + encodeURIComponent(e.path)));
     } else {
       return enterEditMode(e); // md/代码/纯文本：打开即可编辑、自动保存守卫
@@ -635,8 +668,29 @@ async function openPreview(e) {
       body.innerHTML = `<div class="preview-meta"><span>${fmtSize(e.size)}</span><span>${d.entries.length}${d.truncated ? '+' : ''} 项</span></div><div class="arch-list">${rows}</div>`;
     }
   } else {
-    body.innerHTML = `<div class="empty-state"><div class="big">${iconSvg(e, 48)}</div>这个文件类型无法预览<br><br>${fmtSize(e.size)}</div>`;
+    renderUnsupported(e, pkey, klabel);
   }
+}
+// 「无法预览」面板：给出「用其它格式预览」的选项 + 可勾选记住此类型（扩展名/无扩展名时按文件名）的选择
+function renderUnsupported(e, pkey, klabel) {
+  const body = $('#preview-body');
+  const btns = PREVIEW_AS.map((k) => `<button class="as-fmt-btn" data-k="${k}">${KIND_LABEL[k]}</button>`).join('');
+  body.innerHTML = `<div class="empty-state">
+    <div class="big">${iconSvg(e, 48)}</div>
+    这个文件类型无法预览<br><span class="dim">${fmtSize(e.size)}</span>
+    <div class="as-fmt">
+      <div class="as-fmt-label">用其它格式预览：</div>
+      <div class="as-fmt-btns">${btns}</div>
+      <label class="as-fmt-remember"><input type="checkbox" id="as-fmt-save"> 记住 <code>${escapeHtml(klabel)}</code> 用此方式预览</label>
+    </div>
+  </div>`;
+  body.querySelectorAll('.as-fmt-btn').forEach((b) => {
+    b.onclick = () => {
+      const k = b.dataset.k;
+      if (body.querySelector('#as-fmt-save')?.checked) setKindOverride(pkey, k);
+      openPreview(e, k);
+    };
+  });
 }
 function renderTextPreview(data) {
   const body = $('#preview-body');
@@ -773,11 +827,35 @@ function fmtDateTime(ms) {
   const d = new Date(ms); const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
-function renderPreviewFoot(e) {
+function renderPreviewFoot(e, opts = {}) {
   const f = $('#preview-foot');
   if (!f) return;
   if (!e || e.isDir) { f.innerHTML = ''; return; }
-  f.innerHTML = `<span title="大小">${e.size ? fmtSize(e.size) : '0 B'}</span><span title="创建时间">创建 ${fmtDateTime(e.btime)}</span><span title="修改时间">改 ${fmtDateTime(e.mtime)}</span>`;
+  const k = opts.kind || e.kind;
+  let html = `<span title="大小">${e.size ? fmtSize(e.size) : '0 B'}</span><span title="创建时间">创建 ${fmtDateTime(e.btime)}</span><span title="修改时间">改 ${fmtDateTime(e.mtime)}</span>`;
+  // 图片分辨率 / 视频编码信息：先占位，下面异步抓 ffprobe 填进来
+  if (k === 'image' || k === 'video') html += `<span class="pv-media-info" title="${k === 'image' ? '分辨率' : '编码信息'}">…</span>`;
+  // 记住的预览方式：标注 + 一键改回原始
+  if (opts.savedOverride) html += `<span class="pv-asfmt">以${KIND_LABEL[opts.savedOverride] || opts.savedOverride}预览（<code>${escapeHtml(opts.klabel || '')}</code> 已记住）· <a href="#" class="pv-reset">改回</a></span>`;
+  f.innerHTML = html;
+  const reset = f.querySelector('.pv-reset');
+  if (reset) reset.onclick = (ev) => { ev.preventDefault(); setKindOverride(opts.pkey, null); openPreview(e); };
+  if (k === 'image' || k === 'video') loadMediaInfo(e, f.querySelector('.pv-media-info'), k);
+}
+// 异步抓媒体元信息填进底栏：图片显示分辨率；视频显示编码 · 分辨率 · 时长 · 音轨编码
+async function loadMediaInfo(e, span, k) {
+  if (!span) return;
+  let info;
+  try { info = await api('/api/mediainfo?path=' + encodeURIComponent(e.path)); } catch { info = null; }
+  if (!span.isConnected) return; // 期间已切到别的文件
+  if (!info || !info.ok) { span.remove(); return; }
+  const parts = [];
+  if (k === 'video' && info.vcodec) parts.push(String(info.vcodec).toUpperCase());
+  if (info.width && info.height) parts.push(`${info.width}×${info.height}`);
+  if (k === 'video' && info.duration) parts.push(fmtDuration(info.duration));
+  if (k === 'video' && info.acodec) parts.push('🔊 ' + String(info.acodec).toUpperCase());
+  if (!parts.length) { span.remove(); return; }
+  span.textContent = parts.join(' · ');
 }
 async function copyImage(p) { const r = await window.fanboxClipboard.copyImage(p); toast(r.ok ? '已复制图片，可粘贴到其它应用' : '复制图片失败：' + (r.error || ''), !r.ok); }
 async function copyFile(p) { const r = await window.fanboxClipboard.copyFile(p); toast(r.ok ? '已复制文件，可在访达里粘贴' : '复制文件失败', !r.ok); }

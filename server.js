@@ -205,7 +205,7 @@ async function listDir(dirPath) {
   return { path: dir, parent: path.dirname(dir), entries, breadcrumb, project };
 }
 
-async function readFile(filePath) {
+async function readFile(filePath, forceText) {
   const file = resolvePath(filePath);
   const st = await fsp.stat(file);
   const kind = kindOf(path.basename(file), false);
@@ -213,7 +213,9 @@ async function readFile(filePath) {
     path: file, name: path.basename(file), size: st.size,
     mtime: st.mtimeMs, kind, ext: ext(file),
   };
-  if (kind === 'text') {
+  // forceText：文件类型本不算文本（如 .jsonl）但用户在预览里选了「以文本预览」，照样按文本读
+  if (kind === 'text' || forceText) {
+    if (forceText && kind !== 'text') info.forcedText = true;
     if (st.size > 2 * 1024 * 1024) {
       info.tooLarge = true;
       const fd = await fsp.open(file, 'r');
@@ -1226,6 +1228,47 @@ function hasBin(name) {
     });
   });
 }
+// 跑命令拿 stdout（run() 丢弃输出，这里要解析）
+function execOut(cmd, args, timeout = 8000) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => (err ? reject(err) : resolve(String(stdout || ''))));
+  });
+}
+// 媒体元信息：图片分辨率 / 视频编码·分辨率·时长·音轨编码。ffprobe 通吃图片和视频；
+// 没装 ffprobe 时用 ImageMagick identify、再退 mac sips 兜底拿图片分辨率。拿不到一律 {ok:false}。
+async function mediaInfo(filePath) {
+  const file = resolvePath(filePath);
+  try { await fsp.stat(file); } catch { return { ok: false }; }
+  if (await hasBin('ffprobe')) {
+    try {
+      const j = JSON.parse(await execOut('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', file]));
+      const streams = j.streams || [];
+      const v = streams.find((s) => s.codec_type === 'video');
+      const a = streams.find((s) => s.codec_type === 'audio');
+      const r = { ok: false };
+      if (v) { if (v.width) r.width = v.width; if (v.height) r.height = v.height; if (v.codec_name) r.vcodec = v.codec_name; }
+      if (a && a.codec_name) r.acodec = a.codec_name;
+      const dur = j.format && parseFloat(j.format.duration);
+      if (dur && isFinite(dur) && dur > 0) r.duration = dur;
+      if (r.width || r.vcodec || r.duration) { r.ok = true; return r; }
+    } catch { /* 落到下面兜底 */ }
+  }
+  if (await hasBin('identify')) { // ImageMagick：图片分辨率（[0] 取首帧，gif/多页不卡）
+    try {
+      const [w, h] = (await execOut('identify', ['-format', '%w %h', file + '[0]'])).trim().split(/\s+/).map(Number);
+      if (w && h) return { ok: true, width: w, height: h };
+    } catch { /* */ }
+  }
+  if (await hasBin('sips')) { // mac 兜底
+    try {
+      const out = await execOut('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', file]);
+      const w = Number((out.match(/pixelWidth:\s*(\d+)/) || [])[1]);
+      const h = Number((out.match(/pixelHeight:\s*(\d+)/) || [])[1]);
+      if (w && h) return { ok: true, width: w, height: h };
+    } catch { /* */ }
+  }
+  return { ok: false };
+}
 // ffmpeg 出图：图片直接缩放，视频取 1s 处一帧（图片视频都等比缩进 size 盒子）
 function ffmpegThumb(src, size, out, isVideo) {
   const args = ['-y', '-loglevel', 'error'];
@@ -2125,7 +2168,10 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, await listDir(qp.get('path') || HOME));
     }
     if (p === '/api/read') {
-      return sendJSON(res, 200, await readFile(qp.get('path')));
+      return sendJSON(res, 200, await readFile(qp.get('path'), qp.get('as') === 'text'));
+    }
+    if (p === '/api/mediainfo') {
+      return sendJSON(res, 200, await mediaInfo(qp.get('path')));
     }
     if (p === '/api/raw') {
       return serveRaw(req, res, qp.get('path'));
