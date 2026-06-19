@@ -500,6 +500,20 @@ const DEFAULT_ORGANIZE_STRATEGY = `- 默认归档：过时/低频的文件移入
 - 文件夹一律不动，只整理松散文件
 - 拿不准的单独列出来问，宁可少动不要乱动`;
 
+// codex 各版本旗标常变（0.139 移除了 --full-auto）：按 --help 实测有什么用什么，
+// 全不认识就裸跑——退化成多几次审批确认，但不会因 unexpected argument 拉不起来
+async function codexOrganizeFlags(bin) {
+  const help = await new Promise((resolve) => {
+    execFile(bin, ['--help'], { timeout: 8000 }, (err, stdout) => resolve(err ? '' : String(stdout)));
+  });
+  if (help.includes('--full-auto')) return ' --full-auto';
+  let flags = '';
+  if (help.includes('--sandbox')) flags += ' --sandbox workspace-write';
+  if (help.includes('--ask-for-approval')) flags += ' -a on-request';
+  if (help.includes('--add-dir')) flags += ` --add-dir "${CONFIG_DIR}"`;
+  return flags;
+}
+
 async function findAgentBin(name) {
   // GUI 启动的 app 没有用户 shell 的 PATH，走登录 shell 找一次绝对路径
   const sh = PLATFORM === 'darwin' ? '/bin/zsh' : (process.env.SHELL || '/bin/bash');
@@ -533,9 +547,11 @@ async function organizeLaunch(b) {
   const dir = resolvePath(b.path);
   const cfg = await readConfig();
   let engine = cfg.organizeEngine === 'codex' ? 'codex' : 'claude';
-  if (!(await findAgentBin(engine))) {
+  let bin = await findAgentBin(engine);
+  if (!bin) {
     const alt = engine === 'claude' ? 'codex' : 'claude';
-    if (await findAgentBin(alt)) engine = alt;
+    bin = await findAgentBin(alt);
+    if (bin) engine = alt;
     else return { ok: false, error: '没找到 claude / codex 命令——AI 整理需要装其中一个 CLI' };
   }
   const prefs = await fsp.readFile(ORGANIZE_PREFS_FILE, 'utf8').catch(() => '');
@@ -569,8 +585,10 @@ ${history || '（还没有历史记录）'}
   await fsp.mkdir(ORGANIZE_LOG_DIR, { recursive: true });
   await fsp.writeFile(ORGANIZE_BRIEF_FILE, brief, 'utf8');
   const kickoff = `先完整读 ${ORGANIZE_BRIEF_FILE}，然后按里面的约定，和我对话式整理当前文件夹`;
-  // claude 跳权限确认（动手前方案已过人）；codex 用 full-auto（工作区内可写、不逐条审批）
-  const cmd = engine === 'codex' ? `codex --full-auto "${kickoff}"` : `claude --dangerously-skip-permissions "${kickoff}"`;
+  // claude 跳权限确认（动手前方案已过人）；codex 旗标按当前版本实测拼出
+  const cmd = engine === 'codex'
+    ? `codex${await codexOrganizeFlags(bin)} "${kickoff}"`
+    : `claude --dangerously-skip-permissions "${kickoff}"`;
   return { ok: true, engine, cmd };
 }
 
@@ -875,8 +893,14 @@ async function archiveList(p) {
   const file = resolvePath(p);
   try { await fsp.stat(file); } catch { return { ok: false, error: '文件不存在' }; }
   const name = path.basename(file).toLowerCase();
+  // 压缩包里的中文名常是 GBK/CP936 且没设 UTF-8 标志位，按 UTF-8 读会乱码：
+  // 拿原始字节，先严格按 UTF-8 解，失败（多半是 GBK 中文名）再回退 GBK。
+  const decodeMaybeGbk = (buf) => {
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+    catch { try { return new TextDecoder('gbk').decode(buf); } catch { return buf.toString('latin1'); } }
+  };
   const run = (cmd, args) => new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout: 15000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+    execFile(cmd, args, { timeout: 15000, maxBuffer: 8 * 1024 * 1024, encoding: 'buffer' }, (err, stdout) => (err ? reject(err) : resolve(decodeMaybeGbk(stdout))));
   });
   const MAX = 800;
   const entries = [];
@@ -1014,6 +1038,20 @@ async function locatePath(p, name, root, tail, alt, roots) {
       } catch { /* */ }
     }
     if (fuzzy) return { found: true, path: fuzzy.path, isDir: fuzzy.isDir, viaSearch: true };
+    // Spotlight 兜底（macOS）：截断路径常指向所有项目根之外（桌面、下载、临时目录），
+    // 目录遍历够不着；按文件名全盘查，精确同名里取 mtime 最新的（偏向「刚生成的那个」）
+    if (process.platform === 'darwin') {
+      const paths = await mdfind(['-name', name]);
+      let best = null;
+      for (const f of (paths || []).slice(0, 200)) {
+        if (path.basename(f) !== name) continue;
+        try {
+          const st = await fsp.stat(f);
+          if (!best || st.mtimeMs > best.m) best = { path: f, isDir: st.isDirectory(), m: st.mtimeMs };
+        } catch { /* */ }
+      }
+      if (best) return { found: true, path: best.path, isDir: best.isDir, viaSearch: true };
+    }
   }
   return { found: false };
 }
@@ -1265,12 +1303,36 @@ async function serveThumb(req, res, p, size) {
   catch { res.writeHead(415); res.end('no thumb'); } // 前端 onerror 回退矢量图标
 }
 
+// HEIC/HEIF 浏览器与 Chromium 原生不支持：用 sips 全尺寸转码成 jpeg 缓存后再吐，
+// /api/raw 和 /fs/ 都透明走这条，markdown 里的 ![](x.heic) 预览即可显示。复用缩略图那套 run/缓存/LRU。
+const HEIC_EXT = new Set(['heic', 'heif']);
+async function serveHeicAsJpeg(req, res, file, st) {
+  const key = crypto.createHash('md5').update(file + ':' + st.mtimeMs).digest('hex');
+  const cacheFile = path.join(THUMB_DIR, key + '.heic.jpg');
+  const send = () => {
+    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'max-age=604800' });
+    const rs = fs.createReadStream(cacheFile);
+    rs.on('error', () => { try { res.destroy(); } catch { /* */ } });
+    rs.pipe(res);
+  };
+  if (fs.existsSync(cacheFile)) return send();
+  let pr = thumbInflight.get(cacheFile);
+  if (!pr) {
+    pr = (async () => { await fsp.mkdir(THUMB_DIR, { recursive: true }); await run('sips', ['-s', 'format', 'jpeg', file, '--out', cacheFile]); })()
+      .finally(() => thumbInflight.delete(cacheFile));
+    thumbInflight.set(cacheFile, pr);
+  }
+  try { await pr; pruneThumbs(); send(); }
+  catch { res.writeHead(415); res.end('heic transcode failed'); } // 前端 onerror 回退矢量图标
+}
+
 // 流式返回原始文件（图片 / 视频 / pdf / 音频预览），支持 Range
 function serveRaw(req, res, filePath) {
   let file;
   try { file = resolvePath(filePath); } catch { res.writeHead(400); res.end('bad path'); return; }
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404); res.end('not found'); return; }
+    if (HEIC_EXT.has(ext(file))) return serveHeicAsJpeg(req, res, file, st); // HEIC → 转码 jpeg，绕过下面的原始字节路径
     const type = MIME[ext(file)] || 'application/octet-stream';
     const onStreamErr = (rs) => rs.on('error', () => { try { res.destroy(); } catch { /* */ } });
     const range = req.headers.range;
@@ -1300,6 +1362,73 @@ function serveRaw(req, res, filePath) {
       onStreamErr(rs); rs.pipe(res);
     }
   });
+}
+
+// 为 /fs/ 下 HTML 预览注入辅助标签：
+// 1. 测宽脚本——桌面 Chromium 的 iframe 会忽略 viewport meta，定宽桌面页照样按自身宽度铺开，
+//    窄预览框只能露出左上角；脚本把页面自然宽度 postMessage 给前端，由前端整页等比缩放适配。
+// 2. 兜底样式——html/body 可滚动、图片视频不超宽（canvas/svg 不动，挤压它们会让动效 demo 变形）。
+// 3. viewport meta——桌面 iframe 用不上，但保留它，手机经局域网访问预览时有用。
+async function serveHtmlPreview(req, res, filePath) {
+  let file;
+  try { file = resolvePath(filePath); } catch { res.writeHead(400); res.end('bad path'); return; }
+  try {
+    const st = await fsp.stat(file);
+    if (!st.isFile()) { res.writeHead(404); res.end('not found'); return; }
+  } catch { res.writeHead(404); res.end('not found'); return; }
+  try {
+    let html = await fsp.readFile(file, 'utf8');
+    const viewportRe = /<meta[^>]*name=["']viewport["'][^>]*>/i;
+    const styleBlock = `<style data-fanbox-preview>
+  html, body { overflow: auto; }
+  img, video { max-width: 100%; height: auto; }
+</style>`;
+    const measureScript = '<script data-fanbox-measure>(function(){var l=0;function r(){var w=Math.max(document.documentElement.scrollWidth,document.body?document.body.scrollWidth:0);if(w&&w!==l){l=w;try{parent.postMessage({fanboxPreviewWidth:w},"*")}catch(e){}}}addEventListener("load",function(){r();setTimeout(r,300)});addEventListener("resize",r)})()</script>';
+    // 本地图片引用兜底：不同 agent 写 html 引图方式各异，http 预览（沙箱 iframe）里有两类必裂——
+    //   ① file:// 绝对 URL（http 页面禁加载 file://）；② /Users 这种裸绝对路径（解析到源站根）。
+    // 策略分两层，确保「修问题不引入新问题」：
+    //   · 主动改写：只碰 file://（http 预览里永远加载不了，改成 /fs 镜像只会帮忙、不会误伤任何能用的引用）；
+    //   · 失败兜底：其余绝对路径只在「已加载失败」时才重写到 /fs 再试一次（对本来能加载的引用零影响 → 结构性零回归）。
+    //   · 相对路径走 /fs/<目录>/ 本就正常，失败多半是文件真没了，不强行兜底。
+    // 未覆盖（注释在此说清，别让后人误以为全兜住）：<style> 块/外部 css 里的 file:// 背景图、srcset、加载后 JS 动态插入的元素。
+    const localImgScript = '<script data-fanbox-localimg>(function(){var FS="/fs";function f2fs(u){return (u&&u.slice(0,7)==="file://")?FS+u.slice(7):null;}function fix(el){if(!el.getAttribute)return;["src","href","poster"].forEach(function(a){var v=el.getAttribute(a),n=f2fs(v);if(n)el.setAttribute(a,n);});var st=el.getAttribute("style");if(st&&st.indexOf("file://")>-1)el.setAttribute("style",st.split("file://").join(FS));}function sweep(){document.querySelectorAll("[src],[href],[poster],[style]").forEach(fix);}sweep();document.addEventListener("DOMContentLoaded",sweep);document.addEventListener("error",function(e){var el=e.target;if(!el||!el.getAttribute||el.getAttribute("data-fs-tried"))return;var attr=el.tagName==="LINK"?"href":"src",v=el.getAttribute(attr);if(!v||v.charAt(0)!=="/"||v.slice(0,4)==="/fs/")return;if(/^(https?:|data:|blob:)/.test(v))return;el.setAttribute("data-fs-tried","1");el.setAttribute(attr,FS+v);},true);})()</script>';
+    function injectHead(tag) {
+      const headClose = html.match(/<\/head>/i);
+      const headOpen = html.match(/<head[^>]*>/i);
+      if (headClose) {
+        html = html.slice(0, headClose.index) + '  ' + tag + '\n' + html.slice(headClose.index);
+      } else if (headOpen) {
+        html = html.slice(0, headOpen.index + headOpen[0].length) + '\n  ' + tag + '\n' + html.slice(headOpen.index + headOpen[0].length);
+      } else {
+        // 没有 <head> 时，把标签插到 <!DOCTYPE ...> 之后，或文档最开头
+        const doctype = html.match(/<!DOCTYPE[^>]*>/i);
+        if (doctype) {
+          html = html.slice(0, doctype.index + doctype[0].length) + '\n' + tag + html.slice(doctype.index + doctype[0].length);
+        } else {
+          html = tag + '\n' + html;
+        }
+      }
+    }
+    if (!viewportRe.test(html)) {
+      injectHead('<meta name="viewport" content="width=device-width, initial-scale=1">');
+    }
+    if (!html.includes('data-fanbox-preview')) {
+      injectHead(styleBlock);
+    }
+    if (!html.includes('data-fanbox-measure')) {
+      injectHead(measureScript);
+    }
+    if (!html.includes('data-fanbox-localimg')) {
+      injectHead(localImgScript);
+    }
+    const buf = Buffer.from(html, 'utf8');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+    res.end(buf);
+  } catch (err) {
+    // 读取/编码异常时回退到原始流，保证至少能打开
+    console.error('serveHtmlPreview fallback', err);
+    return serveRaw(req, res, filePath);
+  }
 }
 
 const MAX_BODY = 64 * 1024 * 1024; // 64MB 上限，防止恶意请求无限累加把内存撑爆
@@ -2005,8 +2134,14 @@ const server = http.createServer(async (req, res) => {
     // HTML 预览的 iframe 指到这里后，页面里的相对引用（./img.png、子目录、嵌套 iframe）
     // 都能按所在目录正确解析——srcdoc 方案没有 base URL，这些全是裂的。
     // 暴露面与 /api/raw 等价（都接受任意绝对路径），且同样只对本机回环开放。
+    // HTML 文件额外注入 viewport，让预览框内宽度自适应、滚动稳定。
     if (p.startsWith('/fs/')) {
-      return serveRaw(req, res, decodeURIComponent(p.slice(3)));
+      const fsPath = decodeURIComponent(p.slice(3));
+      const fsExt = (ext(fsPath) || '').toLowerCase();
+      if (fsExt === 'html' || fsExt === 'htm') {
+        return serveHtmlPreview(req, res, fsPath);
+      }
+      return serveRaw(req, res, fsPath);
     }
     if (p === '/api/thumb') {
       return serveThumb(req, res, qp.get('path'), parseInt(qp.get('w') || '240', 10));
@@ -2379,6 +2514,36 @@ server.on('error', (err) => {
   }
   process.exit(1);
 });
+
+// 预览专用服务器：只出 /fs/ 静态文件，绝不暴露 /api（删文件/开应用等危险接口）。
+// HTML 预览 iframe 指到这个独立端口 + 开 allow-same-origin：页面拿到「自己的」完整源
+// （localStorage/fetch 都能跑），却与 App 跨源——碰不到 App 的 DOM、localStorage 和 /api，
+// 也无法摘掉 sandbox 反向接管（那要求同源）。可读范围再收紧到主目录、挡掉点目录（.ssh/.aws/.config…），
+// 防止恶意预览页 same-origin 下读敏感文件外泄。
+const PREVIEW_PORT = PORT + 1;
+function previewPathAllowed(file) {
+  const real = path.resolve(file);
+  const home = path.resolve(HOME);
+  if (real !== home && !real.startsWith(home + path.sep)) return false; // 只放行主目录以下
+  return !real.slice(home.length).split(path.sep).some((s) => s.startsWith('.')); // 任一段是点目录/点文件 → 拒
+}
+const previewServer = http.createServer(async (req, res) => {
+  if (!hostAllowed(req)) { res.writeHead(403); res.end('forbidden host'); return; }
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end('method not allowed'); return; }
+  const p = new URL(req.url, `http://localhost:${PREVIEW_PORT}`).pathname;
+  if (!p.startsWith('/fs/')) { res.writeHead(403); res.end('preview server serves /fs/ only'); return; }
+  const raw = decodeURIComponent(p.slice(3));
+  let resolved;
+  try { resolved = resolvePath(raw); } catch { res.writeHead(400); res.end('bad path'); return; }
+  if (!previewPathAllowed(resolved)) { res.writeHead(403); res.end('outside preview scope'); return; }
+  try {
+    const fsExt = (ext(raw) || '').toLowerCase();
+    if (fsExt === 'html' || fsExt === 'htm') return serveHtmlPreview(req, res, raw);
+    return serveRaw(req, res, raw);
+  } catch (err) { res.writeHead(500); res.end(String((err && err.message) || err)); }
+});
+previewServer.on('error', (err) => { console.error('  ⚠️  预览服务器启动失败：', err.message); });
+previewServer.listen(PREVIEW_PORT, '127.0.0.1', () => { console.log(`  🖼  预览源（隔离）：http://localhost:${PREVIEW_PORT}`); });
 
 server.listen(PORT, '127.0.0.1', () => {
   const link = `http://localhost:${PORT}`;

@@ -28,8 +28,6 @@ window.FANBOX_DICT = {
 
   // ---------- 顶栏 ----------
   '折叠 / 展开侧栏 (⌘B)': 'Toggle sidebar (⌘B)',
-  '后退': 'Back',
-  '上一级': 'Up one level',
   '显示隐藏文件': 'Show hidden files',
   '隐藏文件': 'Hidden files',
   '名称': 'Name',
@@ -261,8 +259,13 @@ window.FANBOX_DICT = {
   // ---------- 终端 ----------
   '启动 Claude Code（跳过权限确认）：空闲终端就地启动，正跑着任务则新开标签': 'Launch Claude Code (skipping permission prompts): starts in the idle terminal, or opens a new tab if one is busy',
   '启动 Codex：空闲终端就地启动，正跑着任务则新开标签': 'Launch Codex: starts in the idle terminal, or opens a new tab if one is busy',
-  '终端跟随浏览：进文件夹时终端自动 cd 过去': 'Terminal follows browsing: auto-cd when you enter a folder',
-  '终端跟随': 'Follow',
+  '文件跟随：跟着当前终端 tab 的 agent，它改哪个文件，文件区和预览就跟到哪；html/md 边写边出实时预览（手动浏览即自动停）': "Follow files: tracks the current terminal tab's agent — the file view and preview follow whatever it edits; html/md render live as they are written (any manual browsing stops it)",
+  '文件跟随': 'Follow files',
+  '绑定的终端已关闭，文件跟随已停': 'The bound terminal was closed — follow stopped',
+  '文件跟随已开：agent 改哪个文件就看哪个': 'Follow on: now tracking whatever file the agent edits',
+  '文件跟随已停': 'Follow stopped',
+  '手动接管，文件跟随已停': 'You took over — follow stopped',
+  '跟随中': 'LIVE',
   '把文件区跳到终端当前所在目录': "Jump file view to the terminal's current folder",
   '定位文件': 'Locate',
   '新终端': 'New terminal',
