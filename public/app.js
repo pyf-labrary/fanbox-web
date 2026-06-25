@@ -310,6 +310,39 @@ function thumbUrl(p, w, ver) { return `/api/thumb?path=${encodeURIComponent(p)}&
 function goBack() { if (state.history.length) navigate(state.history.pop(), false); }
 function goUp() { if (state.parent && state.parent !== state.cwd) navigate(state.parent); }
 
+// 跳转到指定路径：弹输入框（预填当前目录），回车后进到该文件夹
+async function gotoPathPrompt() {
+  const v = await inputDialog('跳转到路径', state.cwd || '', '绝对路径，如 /home/pyf/tools、~/Downloads（WSL 可直接贴 Windows 路径）');
+  if (v) jumpToPath(v);
+}
+// 把贴进来的 Windows 路径就地转成 WSL 路径（\\wsl.localhost\Distro\... 与 C:\... 两种常见形态，纯前端转换不开子进程）
+function winToPosix(p) {
+  let m = p.match(/^\\\\wsl(?:\.localhost|\$)\\[^\\]+(\\[\s\S]*)?$/i); // \\wsl.localhost\Ubuntu\home\pyf → /home/pyf
+  if (m) return (m[1] || '\\').replace(/\\/g, '/') || '/';
+  m = p.match(/^([A-Za-z]):\\([\s\S]*)$/); // C:\Users\x → /mnt/c/Users/x
+  if (m) return '/mnt/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/');
+  return p;
+}
+async function jumpToPath(input) {
+  let p = String(input || '').trim().replace(/^['"]+|['"]+$/g, ''); // 去掉顺手贴进来的包裹引号
+  if (!p) return;
+  if (state.isWsl && /^([A-Za-z]:\\|\\\\)/.test(p)) p = winToPosix(p);
+  // 探测：是目录就进去；是文件就进所在目录并选中它；都不是就报错
+  const probe = await api('/api/list?path=' + encodeURIComponent(p));
+  if (!probe.error) { navigate(p); return; }
+  const parent = dirOf(p);
+  if (parent && parent !== p) {
+    const par = await api('/api/list?path=' + encodeURIComponent(parent));
+    if (!par.error) {
+      await navigate(parent);
+      const e = state.entries.find((x) => x.path === p || x.name === baseOf(p));
+      if (e) { applySelection(e.path); openPreview(e); recordRecent(e.path); renderFiles(); }
+      return;
+    }
+  }
+  toast('找不到该路径：' + probe.error, true);
+}
+
 // ---------- 渲染 ----------
 function render() {
   renderBreadcrumb();
@@ -805,7 +838,7 @@ function renderPreviewActions(e) {
     ...(e.kind === 'text' ? [{ icon: ic('gitbranch', 'currentColor', 15), title: '查看改动（HEAD vs 当前）', fn: () => showDiff(e) }] : []),
     ...(e.kind === 'image' ? [{ icon: ic('edit3', 'currentColor', 15), title: '编辑图片', fn: () => enterImageEdit(e) }] : []),
     { icon: ic('term', 'currentColor', 15), title: '在编辑器打开', fn: () => openWith(e.path, 'editor') },
-    { icon: ic('folder', 'currentColor', 15), title: '在访达显示', fn: () => openWith(e.path, 'reveal') },
+    { icon: ic('folder', 'currentColor', 15), title: '系统打开该文件夹', fn: () => openWith(e.path, 'reveal') },
     ...(e.kind === 'image' && clip ? [{ icon: ic('image', 'currentColor', 15), title: '复制图片（可粘贴到其它应用）', fn: () => copyImage(e.path) }] : []),
     ...(clip ? [{ icon: ic('copy', 'currentColor', 15), title: '复制文件（访达里可粘贴）', fn: () => copyFile(e.path) }] : []),
     { icon: ic('clip', 'currentColor', 15), title: '复制路径', fn: () => copyPath(e.path) },
@@ -1246,7 +1279,7 @@ async function openWith(p, withApp) {
   const r = await apiPost('/api/open', { path: p, with: withApp });
   if (r.ok) {
     const used = r.with;
-    if (used === 'reveal') toast('已在文件管理器中显示');
+    if (used === 'reveal') toast('已在系统文件管理器打开');
     else if (used === 'terminal') toast('已在终端打开此目录');
     else if (used === 'editor') toast('已在编辑器打开');
     else if (withApp === 'editor' && used === 'default') toast('未找到 code 命令，已用默认应用打开');
@@ -1811,7 +1844,7 @@ function showContextMenu(ev, e) {
   if (e.kind === 'text') items.push({ label: '编辑文本', fn: () => enterEditMode(e) });
   if (e.kind === 'image') items.push({ label: '编辑图片', fn: () => enterImageEdit(e) });
   items.push({ label: '在编辑器打开', fn: () => openWith(e.path, 'editor') });
-  items.push({ label: '在 Finder 显示', fn: () => openWith(e.path, 'reveal') });
+  items.push({ label: '系统打开该文件夹', fn: () => openWith(e.path, 'reveal') });
   items.push({ label: '复制路径', fn: () => copyPath(e.path) });
   items.push({ sep: true });
   items.push({ label: isFav(e.path) ? '取消收藏' : '收藏', fn: () => toggleFav(e) });
@@ -1879,6 +1912,7 @@ async function loadRoots() {
   const data = await api('/api/roots');
   state.home = data.home;
   state.platform = data.platform;
+  state.isWsl = !!data.isWsl;
   state.sep = data.sep || '/';
   const ul = $('#roots-list');
   ul.innerHTML = '';
@@ -2314,6 +2348,9 @@ function bindEvents() {
   muteBtn.onclick = () => { state.muted = !state.muted; localStorage.setItem('fb_muted', state.muted ? '1' : '0'); syncMute(); if (!state.muted) playChime('tick'); };
   $('#term-close').onclick = () => term.close();
   $('#btn-sidebar').onclick = () => toggleSidebar();
+  $('#btn-goto').onclick = () => gotoPathPrompt();
+  // 双击路径栏空白处（非某一节面包屑）= 跳转到路径，像地址栏一样直接编辑
+  $('#breadcrumb').addEventListener('dblclick', (ev) => { if (ev.target.id === 'breadcrumb') gotoPathPrompt(); });
   $('#file-follow').onclick = () => setFileFollow(!follow.on);
   $('#term-locate').onclick = () => term.locateCwd();
   // 终端随窗口尺寸变化重排，避免 TUI 错位
@@ -4198,7 +4235,7 @@ function followArtifactCard(e) {
       <div class="big">${iconSvg(real, 48)}</div>
       <div class="art-name">${escapeHtml(e.name)}</div>
       <div class="art-sub">agent 刚生成${sizeStr ? ' · ' + sizeStr : ''}</div>
-      <div class="art-btns"><button class="ghost-btn" data-act="reveal">在访达显示</button><button class="ghost-btn" data-act="open">打开</button></div>
+      <div class="art-btns"><button class="ghost-btn" data-act="reveal">系统打开该文件夹</button><button class="ghost-btn" data-act="open">打开</button></div>
     </div>`;
   body.querySelector('[data-act="reveal"]').onclick = () => openWith(e.path, 'reveal');
   body.querySelector('[data-act="open"]').onclick = () => openWith(e.path, 'default');

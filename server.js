@@ -1130,7 +1130,7 @@ function openInOS(target, withApp) {
       else if (PLATFORM === 'win32') cmd = `start "" cmd /K cd /d "${dir}"`;
       else if (IS_WSL) cmd = `wt.exe wsl.exe --cd ${shellQuote(dir)} || cmd.exe /c start wsl.exe --cd ${shellQuote(dir)}`; // 翻箱跑在 WSL 里：开 Windows 侧终端进同目录
       else cmd = `x-terminal-emulator --working-directory=${shellQuote(dir)} || gnome-terminal --working-directory=${shellQuote(dir)} || xterm`;
-      exec(cmd, (err) => resolve(err ? { ok: false, error: err.message } : { ok: true, with: 'terminal' }));
+      exec(cmd, IS_WSL ? { env: wslEnv() } : undefined, (err) => resolve(err ? { ok: false, error: err.message } : { ok: true, with: 'terminal' }));
       return;
     }
     if (withApp === 'editor') {
@@ -1149,21 +1149,60 @@ function openInOS(target, withApp) {
   });
 }
 
+// WSL 下调 Windows 程序的子进程环境：systemd 用户服务的 PATH 不含 Windows 目录，裸 explorer.exe / cmd.exe / wslview
+// 会「command not found」——这正是「点系统打开该文件夹没反应」的根因（之前还把错误吞了报成功）。补上 Windows 系统目录即可
+// （interop 本身实测不依赖 WSL_INTEROP，裸路径就能拉起 Windows 进程）。
+function wslEnv() {
+  const env = { ...process.env };
+  const have = (env.PATH || '').split(':');
+  const add = ['/mnt/c/Windows/System32', '/mnt/c/Windows'].filter((d) => !have.includes(d));
+  if (add.length) env.PATH = (env.PATH ? env.PATH + ':' : '') + add.join(':');
+  return env;
+}
+// explorer.exe 全路径（绕开 PATH 最稳），找不到就退回裸名字交给补好的 PATH
+let _explorerExe;
+function explorerExe() {
+  if (_explorerExe !== undefined) return _explorerExe;
+  _explorerExe = 'explorer.exe';
+  for (const c of ['/mnt/c/Windows/explorer.exe', '/mnt/c/WINDOWS/explorer.exe']) {
+    try { fs.accessSync(c); _explorerExe = c; break; } catch { /* 试下一个 */ }
+  }
+  return _explorerExe;
+}
+// explorer.exe 成功也返回退出码 1，只把「找不到命令 / 可执行文件不存在」(127) 当真失败
+function wslExplorerResult(err, tag) {
+  if (err && (err.code === 127 || /not found|No such file/i.test(err.message || ''))) {
+    return { ok: false, error: '调不起 Windows 资源管理器：explorer.exe 不在 PATH 上（已尝试全路径仍失败）' };
+  }
+  return { ok: true, with: tag };
+}
+
 function openDefault(target, withApp) {
   return new Promise((resolve) => {
     let cmd;
+    // 「系统打开该文件夹」(reveal)：目标是目录就进它本身，是文件就在所在文件夹里定位选中——两种都落到该文件夹。
+    const targetIsDir = (() => { try { return fs.statSync(target).isDirectory(); } catch { return false; } })();
     if (PLATFORM === 'darwin') {
-      if (withApp === 'reveal') cmd = `open -R ${shellQuote(target)}`;
+      if (withApp === 'reveal') cmd = targetIsDir ? `open ${shellQuote(target)}` : `open -R ${shellQuote(target)}`;
       else cmd = `open ${shellQuote(target)}`;
     } else if (PLATFORM === 'win32') {
-      if (withApp === 'reveal') cmd = `explorer /select,"${target}"`;
-      else cmd = `start "" "${target}"`;
+      // explorer 即使成功也常返回非零退出码，单独跑并忽略 err 当成功
+      if (withApp === 'reveal') { exec(targetIsDir ? `explorer "${target}"` : `explorer /select,"${target}"`, () => resolve({ ok: true, with: 'reveal' })); return; }
+      cmd = `start "" "${target}"`;
     } else if (IS_WSL) {
-      // 翻箱跑在 WSL 里：用 Windows 侧资源管理器/默认程序打开（wslpath 转成 \\wsl.localhost\ 路径）
-      if (withApp === 'reveal') { exec(`explorer.exe /select,"$(wslpath -w ${shellQuote(target)})"`, () => resolve({ ok: true, with: 'reveal' })); return; }
-      cmd = `wslview ${shellQuote(target)} || explorer.exe "$(wslpath -w ${shellQuote(target)})"`;
+      // 翻箱跑在 WSL 里：转发给 Windows 资源管理器（wslpath 转成 \\wsl.localhost\ 路径），explorer 用全路径 + 补好的 PATH。
+      const env = wslEnv();
+      const exe = shellQuote(explorerExe());
+      if (withApp === 'reveal') {
+        const sel = targetIsDir ? '' : '/select,';
+        exec(`${exe} ${sel}"$(wslpath -w ${shellQuote(target)})"`, { env }, (err) => resolve(wslExplorerResult(err, 'reveal')));
+        return;
+      }
+      // 打开文件/目录本身：装了 wslu 用 wslview，否则回退 explorer.exe
+      exec(`wslview ${shellQuote(target)} || ${exe} "$(wslpath -w ${shellQuote(target)})"`, { env }, (err) => resolve(wslExplorerResult(err, withApp || 'default')));
+      return;
     } else {
-      if (withApp === 'reveal') cmd = `xdg-open ${shellQuote(path.dirname(target))}`;
+      if (withApp === 'reveal') cmd = `xdg-open ${shellQuote(targetIsDir ? target : path.dirname(target))}`;
       else cmd = `xdg-open ${shellQuote(target)}`;
     }
     exec(cmd, (err) => {

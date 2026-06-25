@@ -71,6 +71,7 @@ window.FANBOX_DICT = {
   '在编辑器打开': 'Open in editor',
   '在 Finder 显示': 'Reveal in Finder',
   '在访达显示': 'Reveal in Finder',
+  '系统打开该文件夹': 'Open in file manager',
   '复制路径': 'Copy path',
   '取消收藏': 'Unfavorite',
   '重命名…': 'Rename…',
@@ -150,6 +151,10 @@ window.FANBOX_DICT = {
   // ---------- 操作提示（toast）----------
   '打开失败': 'Open failed',
   '已在文件管理器中显示': 'Revealed in Finder',
+  '已在系统文件管理器打开': 'Opened in file manager',
+  '跳转到路径': 'Go to path',
+  '绝对路径，如 /home/pyf/tools、~/Downloads（WSL 可直接贴 Windows 路径）': 'Absolute path, e.g. /home/pyf/tools or ~/Downloads (on WSL you can paste a Windows path)',
+  '跳转到指定路径（双击路径栏空白处也可）': 'Go to a path (or double-click the empty breadcrumb area)',
   '已在终端打开此目录': 'Opened this folder in terminal',
   '已在编辑器打开': 'Opened in editor',
   '未找到 code 命令，已用默认应用打开': "'code' command not found — opened with default app",
@@ -390,6 +395,7 @@ window.FANBOX_DICT_RULES = [
   [/^([\d.]+) 小时$/, (m) => `${m[1]} hr`],
   // 错误前缀类
   [/^无法打开：([\s\S]*)$/, (m) => `Can't open: ${m[1]}`],
+  [/^找不到该路径：([\s\S]*)$/, (m) => `Path not found: ${m[1]}`],
   [/^打开失败：([\s\S]*)$/, (m) => `Open failed: ${m[1]}`],
   [/^保存失败：([\s\S]*)$/, (m) => `Save failed: ${m[1]}`],
   [/^重命名失败：([\s\S]*)$/, (m) => `Rename failed: ${m[1]}`],
