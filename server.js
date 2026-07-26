@@ -2209,6 +2209,17 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/read') {
       return sendJSON(res, 200, await readFile(qp.get('path'), qp.get('as') === 'text'));
     }
+    // 只要元信息、不读内容：markdown 里点相对链接时先探一下目标是文件还是目录（大文件不必读进内存）
+    if (p === '/api/stat') {
+      try {
+        const f = resolvePath(qp.get('path'));
+        const st = await fsp.stat(f);
+        return sendJSON(res, 200, {
+          path: f, name: path.basename(f), size: st.size, mtime: st.mtimeMs,
+          isDir: st.isDirectory(), kind: kindOf(path.basename(f), st.isDirectory()), ext: ext(f),
+        });
+      } catch (e) { return sendJSON(res, 200, { error: e.message }); }
+    }
     if (p === '/api/mediainfo') {
       return sendJSON(res, 200, await mediaInfo(qp.get('path')));
     }

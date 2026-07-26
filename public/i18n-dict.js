@@ -155,6 +155,7 @@ window.FANBOX_DICT = {
   '跳转到路径': 'Go to path',
   '绝对路径，如 /home/pyf/tools、~/Downloads（WSL 可直接贴 Windows 路径）': 'Absolute path, e.g. /home/pyf/tools or ~/Downloads (on WSL you can paste a Windows path)',
   '跳转到指定路径（双击路径栏空白处也可）': 'Go to a path (or double-click the empty breadcrumb area)',
+  '跳转': 'Go to',
   '已在终端打开此目录': 'Opened this folder in terminal',
   '已在编辑器打开': 'Opened in editor',
   '未找到 code 命令，已用默认应用打开': "'code' command not found — opened with default app",

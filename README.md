@@ -242,6 +242,9 @@ FanBox's core capabilities come from these excellent open-source projects:
 | [Milkdown](https://milkdown.dev/)（Crepe） | Markdown 所见即所得编辑<br>Markdown WYSIWYG editing | MIT |
 | [marked](https://marked.js.org/) | Markdown 预览渲染<br>Markdown preview rendering | MIT |
 | [highlight.js](https://highlightjs.org/) | 代码语法高亮<br>Syntax highlighting | BSD-3-Clause |
+| [KaTeX](https://katex.org/) | Markdown 预览里的数学公式（`$…$` / `$$…$$`）<br>Math in Markdown preview | MIT |
+| [Mermaid](https://mermaid.js.org/) | Markdown 预览里的图表（```mermaid，按需懒加载）<br>Diagrams in Markdown preview (lazy-loaded) | MIT |
+| [DOMPurify](https://github.com/cure53/DOMPurify) | 渲染 Markdown 前净化 HTML（陌生文件也敢预览）<br>Sanitizing rendered Markdown HTML | Apache-2.0 / MPL-2.0 |
 | [esbuild](https://esbuild.github.io/) | 把 Milkdown 打成单文件本地 vendor，运行时保持 no-build<br>Bundling Milkdown into a single local vendor file, keeping runtime no-build | MIT |
 | [electron-builder](https://www.electron.build/) | 打包签名 dmg<br>Packaging and signing the dmg | MIT |
 | [Playwright](https://playwright.dev/) | 驱动 Electron 实拍本 README 截图 + UI 验证<br>Driving Electron for README screenshots + UI verification | Apache-2.0 |

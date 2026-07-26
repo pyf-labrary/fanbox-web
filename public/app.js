@@ -730,8 +730,8 @@ function renderTextPreview(data) {
   const meta = `<div class="preview-meta"><span>${data.ext || 'txt'}</span><span>${fmtSize(data.size)}</span><span>${fmtTime(data.mtime)}</span></div>`;
   const ex = (data.ext || '').toLowerCase();
   if ((ex === 'md' || ex === 'markdown') && !window.__noMarked && window.marked) {
-    body.innerHTML = meta + `<div class="md-body">${window.marked.parse(data.content || '')}</div>`;
-    if (window.hljs) body.querySelectorAll('pre code').forEach((b) => { try { window.hljs.highlightElement(b); } catch {} });
+    body.innerHTML = meta + `<div class="md-body"></div>`;
+    renderMdInto(body.querySelector('.md-body'), data.content || '', data.path);
   } else if (ex === 'csv' || ex === 'tsv') {
     body.innerHTML = meta + csvTable(data.content || '', ex === 'tsv' ? '\t' : ',');
   } else if (ex === 'html' || ex === 'htm') {
@@ -746,6 +746,26 @@ function renderTextPreview(data) {
     body.appendChild(pre);
     if (window.hljs && !window.__noHljs) { try { window.hljs.highlightElement(code); } catch {} }
   }
+}
+// md 渲染统一入口：md.js 负责语法（表格/脚注/提示块/数学/mermaid/相对路径…），这里只接上宿主能力——
+// 点图开 lightbox（可翻这篇文档里的所有图）、点相对链接直接在 FanBox 里打开那个文件
+function renderMdInto(host, content, filePath) {
+  if (!host) return;
+  const baseDir = filePath ? dirOf(filePath) : '';
+  host.innerHTML = window.fbMd ? window.fbMd.render(content, { baseDir }) : escapeHtml(content);
+  if (!window.fbMd) return;
+  window.fbMd.enhance(host, {
+    baseDir,
+    onImage: (list, i) => lightbox(list, i),
+    onOpenPath: async (abs) => {
+      const d = await api('/api/stat?path=' + encodeURIComponent(abs));
+      if (!d || d.error) { toast('找不到：' + abs, true); return; }
+      if (d.isDir) { navigate(abs); return; }
+      await navigate(dirOf(abs));
+      const e = state.entries.find((x) => x.path === abs) || d;
+      applySelection(abs); openPreview(e); recordRecent(abs); renderFiles();
+    },
+  });
 }
 function csvTable(text, delim) {
   const rows = text.split('\n').filter((r) => r.trim()).slice(0, 500).map((r) => r.split(delim));
@@ -902,18 +922,147 @@ async function closePreview() {
   applySelection(null);
   term.fitActive();
 }
-function lightbox(path, nativeImg, mtime) {
-  // heic/heif/tiff 无法渲染原图，放大也用大尺寸缩略图
-  if (nativeImg === undefined) { const ex = (path.split('.').pop() || '').toLowerCase(); nativeImg = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'].includes(ex); }
-  const src = nativeImg ? `/api/raw?path=${encodeURIComponent(path)}&v=${mtime || 0}` : thumbUrl(path, 1600, mtime);
+const NATIVE_IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'];
+const isNativeImg = (p) => NATIVE_IMG_EXT.includes((String(p).split('.').pop() || '').toLowerCase());
+// 一张图在 lightbox 里的地址：heic/heif/tiff 浏览器渲染不了原图，放大也只能用大尺寸缩略图
+function lbSrc(it) {
+  if (it.src) return it.src;
+  return isNativeImg(it.path) ? `/api/raw?path=${encodeURIComponent(it.path)}&v=${it.mtime || 0}` : thumbUrl(it.path, 2000, it.mtime);
+}
+/**
+ * 图片 lightbox：缩放（滚轮以光标为锚点 / ±/ 双击 1:1）、拖拽平移、左右翻上一张下一张。
+ * 调用方式二选一：lightbox(path, nativeImg, mtime) 单张，或 lightbox([{path|src, name}], index) 一组。
+ * 只传单张时自动把当前目录里的其它图片凑成一组，翻页照样能用。
+ */
+function lightbox(a, b, c) {
+  let list, idx = 0;
+  if (Array.isArray(a)) { list = a.slice(); idx = Math.max(0, Math.min(a.length - 1, b | 0)); }
+  else {
+    const path = a, mtime = c;
+    const sibs = (state.visible || []).filter((e) => !e.isDir && e.kind === 'image');
+    list = sibs.length ? sibs.map((e) => ({ path: e.path, name: e.name, mtime: e.mtime })) : [{ path, name: baseOf(path), mtime }];
+    idx = Math.max(0, list.findIndex((x) => x.path === path));
+    if (list[idx] && list[idx].path === path) list[idx].mtime = mtime != null ? mtime : list[idx].mtime;
+  }
+  if (!list.length) return;
+
   const ov = document.createElement('div');
   ov.className = 'lightbox';
-  ov.innerHTML = `<img src="${src}"><div class="lb-hint">点击空白处关闭 · 滚轮缩放</div>`;
-  let scale = 1;
+  ov.tabIndex = -1;
+  ov.innerHTML = `
+    <div class="lb-stage"><img alt=""></div>
+    <button class="lb-nav lb-prev" title="上一张 (←)">‹</button>
+    <button class="lb-nav lb-next" title="下一张 (→)">›</button>
+    <div class="lb-bar">
+      <button data-act="zoom-out" title="缩小 (-)">−</button>
+      <button data-act="zoom-level" title="点一下在 适应窗口 / 1:1 之间切换">100%</button>
+      <button data-act="zoom-in" title="放大 (+)">＋</button>
+      <span class="lb-sep"></span>
+      <span class="lb-name"></span>
+      <span class="lb-count"></span>
+      <span class="lb-sep"></span>
+      <button data-act="close" title="关闭 (Esc)">✕</button>
+    </div>`;
+  const stage = ov.querySelector('.lb-stage');
   const img = ov.querySelector('img');
-  ov.onclick = (ev) => { if (ev.target === ov) ov.remove(); };
-  ov.onwheel = (ev) => { ev.preventDefault(); scale = Math.min(8, Math.max(0.2, scale - ev.deltaY * 0.002)); img.style.transform = `scale(${scale})`; };
+  const nameEl = ov.querySelector('.lb-name');
+  const countEl = ov.querySelector('.lb-count');
+  const levelBtn = ov.querySelector('[data-act=zoom-level]');
+  let scale = 1, tx = 0, ty = 0, fitScale = 1;
+
+  const apply = () => {
+    img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    levelBtn.textContent = Math.round(scale * 100) + '%';
+    ov.classList.toggle('lb-zoomed', scale > fitScale + 0.001);
+  };
+  // 适应窗口：图片按自然尺寸铺，超出舞台才缩小；小图不放大（1:1 更真实）
+  const fit = () => {
+    const sw = stage.clientWidth, sh = stage.clientHeight;
+    const nw = img.naturalWidth || sw, nh = img.naturalHeight || sh;
+    fitScale = Math.min(1, sw / nw, sh / nh) || 1;
+    scale = fitScale; tx = 0; ty = 0;
+    apply();
+  };
+  const zoomAt = (factor, cx, cy) => {
+    const next = Math.min(16, Math.max(0.05, scale * factor));
+    const r = stage.getBoundingClientRect();
+    // 以光标为锚点：光标下的那个像素缩放前后停在原地
+    const ox = (cx == null ? r.width / 2 : cx - r.left) - r.width / 2;
+    const oy = (cy == null ? r.height / 2 : cy - r.top) - r.height / 2;
+    const k = next / scale;
+    tx = ox - (ox - tx) * k;
+    ty = oy - (oy - ty) * k;
+    scale = next;
+    apply();
+  };
+  const show = (i, dir) => {
+    idx = (i + list.length) % list.length;
+    const it = list[idx];
+    img.classList.remove('lb-in-l', 'lb-in-r');
+    if (dir) { void img.offsetWidth; img.classList.add(dir > 0 ? 'lb-in-r' : 'lb-in-l'); }
+    img.src = lbSrc(it);
+    nameEl.textContent = it.name || baseOf(it.path || '');
+    countEl.textContent = list.length > 1 ? `${idx + 1} / ${list.length}` : '';
+    ov.classList.toggle('lb-single', list.length < 2);
+    scale = 1; tx = 0; ty = 0; apply();
+  };
+  img.onload = fit;
+  img.onerror = () => { const it = list[idx]; if (it.path && !img.src.includes('/api/thumb')) img.src = thumbUrl(it.path, 2000, it.mtime); };
+
+  ov.querySelector('.lb-prev').onclick = (ev) => { ev.stopPropagation(); show(idx - 1, -1); };
+  ov.querySelector('.lb-next').onclick = (ev) => { ev.stopPropagation(); show(idx + 1, 1); };
+  ov.querySelector('.lb-bar').onclick = (ev) => {
+    const act = ev.target.closest('button')?.dataset.act;
+    if (!act) return;
+    ev.stopPropagation();
+    if (act === 'zoom-in') zoomAt(1.25);
+    else if (act === 'zoom-out') zoomAt(0.8);
+    else if (act === 'zoom-level') { if (scale > fitScale + 0.001) fit(); else oneToOne(); }
+    else if (act === 'close') close();
+  };
+  ov.onwheel = (ev) => { ev.preventDefault(); zoomAt(ev.deltaY < 0 ? 1.12 : 1 / 1.12, ev.clientX, ev.clientY); };
+  const oneToOne = () => { scale = 1; tx = 0; ty = 0; apply(); };
+  img.ondblclick = (ev) => { ev.stopPropagation(); if (scale > fitScale + 0.001) fit(); else zoomAt(Math.max(2, 1 / fitScale), ev.clientX, ev.clientY); };
+  // 空白处点击关闭；但拖动过（平移大图）不算点击，免得一松手就关了
+  let dragging = false, moved = false, sx = 0, sy = 0, px = 0, py = 0;
+  img.onpointerdown = (ev) => {
+    ev.preventDefault();
+    dragging = true; moved = false;
+    sx = ev.clientX - tx; sy = ev.clientY - ty; px = ev.clientX; py = ev.clientY;
+    img.setPointerCapture(ev.pointerId);
+  };
+  img.onpointermove = (ev) => {
+    if (!dragging) return;
+    tx = ev.clientX - sx; ty = ev.clientY - sy;
+    if (Math.abs(ev.clientX - px) + Math.abs(ev.clientY - py) > 3) moved = true; // 3px 抖动容差：手抖不算拖拽
+    apply();
+  };
+  img.onpointerup = (ev) => { dragging = false; try { img.releasePointerCapture(ev.pointerId); } catch { /* */ } };
+  img.onclick = (ev) => { ev.stopPropagation(); if (!moved && scale <= fitScale + 0.001) close(); };
+  ov.onclick = (ev) => { if (ev.target === ov || ev.target === stage) close(); };
+
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+    else if (ev.key === 'ArrowLeft') { ev.preventDefault(); show(idx - 1, -1); }
+    else if (ev.key === 'ArrowRight' || ev.key === ' ') { ev.preventDefault(); show(idx + 1, 1); }
+    else if (ev.key === '+' || ev.key === '=') { ev.preventDefault(); zoomAt(1.25); }
+    else if (ev.key === '-' || ev.key === '_') { ev.preventDefault(); zoomAt(0.8); }
+    else if (ev.key === '0') { ev.preventDefault(); fit(); }
+    else if (ev.key === '1') { ev.preventDefault(); oneToOne(); }
+    ev.stopPropagation(); // 别漏到主区键盘导航（左右键会翻文件）
+  };
+  const onResize = () => fit();
+  function close() {
+    window.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('resize', onResize);
+    ov.remove();
+  }
+  window.addEventListener('keydown', onKey, true);
+  window.addEventListener('resize', onResize);
+
   document.body.appendChild(ov);
+  ov.focus();
+  show(idx, 0);
 }
 // 布局：侧栏(可折叠) + 主区；折叠时侧栏 display:none 退出栅格，故改单列 1fr 让主区铺满
 function applyLayout() {
@@ -1484,21 +1633,42 @@ async function mdEditor(e, data, mode = 'rich') {
   autosaveFlush = flush;
   dirtyCheck = null;
   const render = async (m) => {
-    if (forceCode) m = 'code'; // 有损文件只允许源码，杜绝静默改写
+    // 富文本往返有损的文件不许进 Crepe（会静默改写），但也不该像以前那样一头栽进源码——
+    // 那正是「markdown 看着就是纯文本」的由来。改成默认落到「预览」：完整渲染，要改再点源码。
+    if (forceCode && m === 'rich') m = 'preview';
     mode = m;
     mona.disposeIfAny(); crepe.disposeIfAny();
     const dis = forceCode; // 富文本按钮是否灰显
+    const seg = [['preview', '预览'], ['rich', '富文本'], ['code', '源码']].map(([k, label]) => {
+      const off = k === 'rich' && dis;
+      return `<button data-md-mode="${k}" class="${m === k ? 'active' : ''}"${off ? ' disabled title="此文件含富文本无法无损保存的语法，只能用源码编辑"' : ''}>${label}</button>`;
+    }).join('');
+    const hint = m === 'preview' ? '只读渲染 · 要改点「源码」'
+      : (dis ? '源码模式（此文件富文本往返有损，已锁定）' : '自动保存 · ⌘S 立即保存');
     body.innerHTML =
-      `<div class="editor-bar"><button id="md-mode" class="ghost-btn"${dis ? ' disabled title="此文件含富文本无法无损保存的语法，已锁定源码模式"' : ''}>${m === 'rich' ? '源码' : '富文本'}</button><span id="md-status" class="editor-hint">${dis ? '源码模式（此文件富文本往返有损，已锁定）' : '自动保存 · ⌘S 立即保存'}</span></div>` +
-      `<div id="ed-host" class="${m === 'rich' ? 'crepe-host' : 'mona-host'}"></div>`;
-    const modeBtn = $('#md-mode');
-    if (modeBtn && !dis) modeBtn.onclick = async () => {
-      await flush();
-      const cur = getValue ? getValue() : content0;
-      if (cur !== baseline) content0 = cur; // 只有真编辑过才采纳编辑器的值；没改就保留磁盘原文，源码视图不被 Milkdown 规范化
-      render(m === 'rich' ? 'code' : 'rich');
-    };
+      `<div class="editor-bar"><div class="seg md-mode-seg">${seg}</div><span id="md-status" class="editor-hint">${hint}</span></div>` +
+      `<div id="ed-host" class="${m === 'rich' ? 'crepe-host' : m === 'preview' ? 'md-preview-host' : 'mona-host'}"></div>`;
+    body.querySelectorAll('[data-md-mode]').forEach((btn) => {
+      if (btn.disabled) return;
+      btn.onclick = async () => {
+        const to = btn.dataset.mdMode;
+        if (to === m) return;
+        await flush();
+        const cur = getValue ? getValue() : content0;
+        if (cur !== baseline) content0 = cur; // 只有真编辑过才采纳编辑器的值；没改就保留磁盘原文，源码视图不被 Milkdown 规范化
+        render(to);
+      };
+    });
     const host = $('#ed-host');
+    if (m === 'preview') {
+      // 只读渲染：不接管保存（getValue 置空 → 自动保存链路整条停掉，绝不会拿渲染结果回写）
+      getValue = null; baseline = '';
+      const wrap = document.createElement('div');
+      wrap.className = 'md-body';
+      host.appendChild(wrap);
+      renderMdInto(wrap, content0, e.path);
+      return;
+    }
     if (m === 'rich') {
       const C = await crepe.load();
       if (!C) { render('code'); return; } // Crepe 加载失败 → 源码模式兜底
@@ -1511,8 +1681,8 @@ async function mdEditor(e, data, mode = 'rich') {
       if (!semanticEqual(front + inst.getMarkdown(), content0)) {
         crepe.disposeIfAny();
         forceCode = true;
-        toast('此文件含富文本无法无损表示的内容，已切到源码模式编辑');
-        return render('code');
+        toast('此文件含富文本无法无损表示的语法，已切到只读预览（要改点「源码」）');
+        return render('preview');
       }
       try { inst.on((l) => l.markdownUpdated(() => queue())); } catch { /* 旧版 Crepe 无 .on，靠下面的 input 兜底 */ }
       host.addEventListener('input', () => queue(), true); // 兜底：键入路径一定触发
@@ -4357,8 +4527,8 @@ async function liveMd(e, first) {
   const range = follow.lastContent == null ? null : changedRange(follow.lastContent, content);
   const nearEnd = !range || range.end >= content.split('\n').length - 4;
   const keep = body.scrollTop;
-  body.innerHTML = `<div class="md-body">${window.marked.parse(content)}</div>`;
-  if (window.hljs && !window.__noHljs) body.querySelectorAll('pre code').forEach((b) => { try { window.hljs.highlightElement(b); } catch { /* */ } });
+  body.innerHTML = '<div class="md-body"></div>';
+  renderMdInto(body.querySelector('.md-body'), content, e.path);
   follow.lastContent = content;
   if (nearEnd) body.scrollTo({ top: body.scrollHeight, behavior: first ? 'auto' : 'smooth' });
   else body.scrollTop = keep;
